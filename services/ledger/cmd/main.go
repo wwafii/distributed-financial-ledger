@@ -6,14 +6,17 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
+	pkgkafka "github.com/wwafii/distributed-financial-ledger/pkg/kafka"
 	"github.com/wwafii/distributed-financial-ledger/pkg/logger"
 	grpchandler "github.com/wwafii/distributed-financial-ledger/services/ledger/internal/handler/grpc"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/repository/postgres"
+	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/worker"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
@@ -30,6 +33,11 @@ func main() {
 	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort == "" {
 		grpcPort = "9101"
+	}
+
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	if kafkaBrokers == "" {
+		kafkaBrokers = "localhost:9094"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -56,6 +64,19 @@ func main() {
 	}
 	log.Info("connected to postgresql successfully")
 
+	// 1. Initialize and Start Outbox Relay Background Worker (Phase 3)
+	brokerList := strings.Split(kafkaBrokers, ",")
+	kafkaPublisher := pkgkafka.NewKafkaPublisher(brokerList)
+	defer kafkaPublisher.Close()
+
+	relay := worker.NewOutboxRelay(pool, kafkaPublisher, log, worker.DefaultConfig())
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+
+	go relay.Start(relayCtx)
+	log.Info("outbox relay background worker started", "brokers", brokerList)
+
+	// 2. Initialize and Start gRPC Server
 	repo := postgres.NewLedgerRepository(pool)
 	handler := grpchandler.NewLedgerHandler(repo)
 
@@ -81,7 +102,8 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Info("shutting down ledger gRPC server gracefully...")
+	log.Info("shutting down ledger service gracefully...")
+	cancelRelay()
 	grpcServer.GracefulStop()
 	log.Info("ledger service stopped cleanly")
 }

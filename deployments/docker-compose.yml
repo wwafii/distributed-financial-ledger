@@ -1,0 +1,147 @@
+name: distributed-ledger
+
+networks:
+  ledger-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  redpanda_data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. PostgreSQL (ACID & Double-Entry Ledger Source of Truth)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledger-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ledger_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432" # Host: 5433 (avoids default 5432 collision)
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../scripts/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ledger_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ledger-net
+
+  # ---------------------------------------------------------------------------
+  # 2. Redis (Idempotency Locks & Sliding-Window Fraud Detection)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ledger-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6380:6379" # Host: 6380 (avoids default 6379 collision)
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ledger-net
+
+  # ---------------------------------------------------------------------------
+  # 3. Message Broker: Redpanda (Kafka-Compatible Engine, No-Zookeeper)
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    container_name: ledger-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - "512M"
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:9094
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:9094
+    ports:
+      - "9094:9094" # Host Kafka port
+      - "9644:9644" # Admin API
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    networks:
+      - ledger-net
+
+  # Redpanda Console: Visual Web UI to view Kafka topics & messages
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: ledger-redpanda-console
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8085:8080" # Web UI: http://localhost:8085
+    depends_on:
+      - redpanda
+    networks:
+      - ledger-net
+
+  # ---------------------------------------------------------------------------
+  # 4. Distributed Tracing: Jaeger All-In-One
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: ledger-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # Web UI: http://localhost:16686
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - ledger-net
+
+  # ---------------------------------------------------------------------------
+  # 5. Metrics Collection: Prometheus
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ledger-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090" # Web UI: http://localhost:9090
+    networks:
+      - ledger-net
+
+  # ---------------------------------------------------------------------------
+  # 6. Metrics Visualization: Grafana
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ledger-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3001:3000" # Web UI: http://localhost:3001 (user: admin / pass: admin)
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - ledger-net

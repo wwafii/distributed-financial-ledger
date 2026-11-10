@@ -1,0 +1,35 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, test coverage, and benchmarks
+*.test
+*.out
+coverage.txt
+profile.pprof
+
+# Go workspace file (keep go.work out if individual repo)
+# go.work
+
+# Dependency directories (remove the comment below to ignore vendor)
+# vendor/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db

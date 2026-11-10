@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+option go_package = "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1;ledgerv1";
+
+service LedgerService {
+  rpc CreateTransaction (CreateTransactionRequest) returns (CreateTransactionResponse);
+  rpc GetAccountBalance (GetAccountBalanceRequest) returns (GetAccountBalanceResponse);
+  rpc FreezeAccount (FreezeAccountRequest) returns (FreezeAccountResponse);
+}
+
+message CreateTransactionRequest {
+  string reference_id = 1;
+  string source_account_number = 2;
+  string destination_account_number = 3;
+  double amount = 4;
+  string currency = 5;
+  string description = 6;
+}
+
+message CreateTransactionResponse {
+  string transaction_id = 1;
+  string reference_id = 2;
+  string status = 3;
+  string created_at = 4;
+}
+
+message GetAccountBalanceRequest {
+  string account_number = 1;
+}
+
+message GetAccountBalanceResponse {
+  string account_id = 1;
+  string account_number = 2;
+  string holder_name = 3;
+  double balance = 4;
+  string currency = 5;
+  string status = 6;
+}
+
+message FreezeAccountRequest {
+  string account_number = 1;
+  string reason = 2;
+}
+
+message FreezeAccountResponse {
+  bool success = 1;
+  string account_number = 2;
+  string status = 3;
+  string message = 4;
+}

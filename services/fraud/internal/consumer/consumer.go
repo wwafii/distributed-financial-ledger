@@ -39,7 +39,7 @@ func NewFraudConsumer(
 	}
 }
 
-// ProcessMessage processes a single transaction event from Kafka
+// ProcessMessage processes a single transaction event from Kafka through the multi-tier action matrix
 func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) error {
 	var evt domain.TransactionCreatedEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
@@ -53,11 +53,16 @@ func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) e
 		return fmt.Errorf("evaluator error: %w", err)
 	}
 
-	if result.IsFraud {
-		c.logger.Warn("🚨 FRAUD DETECTED: Taking immediate mitigation actions!",
+	switch result.Action {
+	case domain.ActionFreeze:
+		// TIER 1 & 2: EMERGENCY BOT / VELOCITY ATTACK
+		c.logger.Warn("🚨 EMERGENCY: BOT/VELOCITY FRAUD DETECTED! Freezing account immediately...",
 			"account", result.AccountNumber,
+			"action", result.Action,
+			"risk_score", result.RiskScore,
 			"reason", result.Reason,
 			"velocity_count", result.VelocityCount,
+			"burst_count", result.BurstCount,
 			"transaction_id", evt.TransactionID,
 		)
 
@@ -75,10 +80,12 @@ func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) e
 			)
 		}
 
-		// 2. Publish fraud.flagged event to Kafka for downstream alerts / audit
+		// 2. Publish fraud.flagged event to Kafka for downstream security / audit
 		if c.publisher != nil {
 			flaggedEvt := domain.FraudFlaggedEvent{
 				AccountNumber: result.AccountNumber,
+				Action:        result.Action,
+				RiskScore:     result.RiskScore,
 				Reason:        result.Reason,
 				FlaggedAt:     time.Now().Format(time.RFC3339),
 				TransactionID: evt.TransactionID,
@@ -86,10 +93,66 @@ func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) e
 			payload, _ := json.Marshal(flaggedEvt)
 			_ = c.publisher.Publish(ctx, "fraud.flagged", result.AccountNumber, payload)
 		}
-	} else {
-		c.logger.Debug("transaction passed fraud check",
+
+	case domain.ActionChallenge:
+		// TIER 4: JUMBO / HIGH AMOUNT TRANSACTION (e.g. buying car, property)
+		// Do NOT freeze account! Request Step-Up Biometric or OTP 2FA.
+		c.logger.Info("⚠️ STEP-UP AUTH REQUIRED: High amount detected (e.g. vehicle/property purchase), requesting biometric/OTP verification without freezing",
+			"account", result.AccountNumber,
+			"action", result.Action,
+			"risk_score", result.RiskScore,
+			"amount", evt.Amount,
+			"reason", result.Reason,
+			"transaction_id", evt.TransactionID,
+		)
+
+		if c.publisher != nil {
+			challengeEvt := domain.FraudChallengeEvent{
+				AccountNumber: result.AccountNumber,
+				TransactionID: evt.TransactionID,
+				Amount:        evt.Amount,
+				ChallengeType: "BIOMETRIC_OR_OTP",
+				RiskScore:     result.RiskScore,
+				Reason:        result.Reason,
+				CreatedAt:     time.Now().Format(time.RFC3339),
+			}
+			payload, _ := json.Marshal(challengeEvt)
+			_ = c.publisher.Publish(ctx, "fraud.challenge_required", result.AccountNumber, payload)
+		}
+
+	case domain.ActionHold:
+		// TIER 3: RAPID CUMULATIVE VOLUME (e.g. structuring, installment payments)
+		// Do NOT freeze account! Place on temporary review hold.
+		c.logger.Warn("⏳ TRANSACTION REVIEW HOLD: Cumulative volume velocity limit reached, placing on temporary hold without freezing",
+			"account", result.AccountNumber,
+			"action", result.Action,
+			"risk_score", result.RiskScore,
+			"cumulative_amount", result.CumulativeAmount,
+			"reason", result.Reason,
+			"transaction_id", evt.TransactionID,
+		)
+
+		if c.publisher != nil {
+			holdEvt := domain.FraudHoldEvent{
+				AccountNumber:    result.AccountNumber,
+				TransactionID:    evt.TransactionID,
+				CumulativeAmount: result.CumulativeAmount,
+				RiskScore:        result.RiskScore,
+				Reason:           result.Reason,
+				HoldDurationSec:  600, // 10 minutes temporary hold
+				CreatedAt:        time.Now().Format(time.RFC3339),
+			}
+			payload, _ := json.Marshal(holdEvt)
+			_ = c.publisher.Publish(ctx, "fraud.review_hold", result.AccountNumber, payload)
+		}
+
+	default: // domain.ActionAllow
+		c.logger.Debug("transaction passed all fraud checks (ALLOW)",
 			"account", evt.SourceAccount,
+			"action", result.Action,
 			"velocity_count", result.VelocityCount,
+			"burst_count", result.BurstCount,
+			"cumulative_amount", result.CumulativeAmount,
 		)
 	}
 

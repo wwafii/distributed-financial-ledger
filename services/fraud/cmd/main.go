@@ -92,8 +92,18 @@ func main() {
 	publisher := pkgkafka.NewKafkaPublisher(brokerList)
 	defer publisher.Close()
 
-	// 4. Initialize Evaluator & Consumer
-	eval := evaluator.NewVelocityEvaluator(rdb, evaluator.DefaultConfig())
+	// 4. Initialize Evaluator & Consumer with industry-grade multi-tier config
+	fraudConfig := evaluator.ConfigFromEnv()
+	log.Info("loaded fraud engine config",
+		"sustained_window", fraudConfig.WindowDuration.String(),
+		"max_sustained_tx", fraudConfig.MaxAllowedInWindow,
+		"burst_window", fraudConfig.BurstWindowDuration.String(),
+		"max_burst_tx", fraudConfig.MaxBurstAllowed,
+		"cumulative_threshold", fraudConfig.CumulativeAmountThreshold,
+		"high_single_threshold", fraudConfig.HighAmountThreshold,
+	)
+
+	eval := evaluator.NewVelocityEvaluator(rdb, fraudConfig)
 	fraudConsumer := consumer.NewFraudConsumer(reader, eval, ledgerClient, publisher, log)
 
 	go fraudConsumer.Start(ctx)

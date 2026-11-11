@@ -15,7 +15,7 @@ scrape_configs:
   - job_name: "ledger-service"
     metrics_path: "/metrics"
     static_configs:
-      - targets: ["host.docker.internal:9101"]
+      - targets: ["host.docker.internal:9111"]
 
   - job_name: "fraud-service"
     metrics_path: "/metrics"

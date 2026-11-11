@@ -11,6 +11,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	pkgkafka "github.com/wwafii/distributed-financial-ledger/pkg/kafka"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/fraud/internal/domain"
 	"github.com/wwafii/distributed-financial-ledger/services/fraud/internal/evaluator"
 )
@@ -41,6 +42,11 @@ func NewFraudConsumer(
 
 // ProcessMessage processes a single transaction event from Kafka through the multi-tier action matrix
 func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) error {
+	ctx = telemetry.ExtractKafka(ctx, &msg)
+	tracer := telemetry.Tracer("fraud-consumer")
+	ctx, span := tracer.Start(ctx, "Kafka Consumer transaction.created")
+	defer span.End()
+
 	var evt domain.TransactionCreatedEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
 		c.logger.Error("failed to deserialize transaction created event", "error", err, "payload", string(msg.Value))
@@ -52,6 +58,9 @@ func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) e
 		c.logger.Error("fraud evaluation error", "error", err, "account", evt.SourceAccount)
 		return fmt.Errorf("evaluator error: %w", err)
 	}
+
+	// Record Prometheus evaluation metric
+	telemetry.FraudEvaluationsTotal.WithLabelValues(string(result.Action)).Inc()
 
 	switch result.Action {
 	case domain.ActionFreeze:
@@ -66,8 +75,8 @@ func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) e
 			"transaction_id", evt.TransactionID,
 		)
 
-		// 1. Send gRPC call to Core Ledger to Freeze Account immediately
-		freezeResp, freezeErr := c.ledgerClient.FreezeAccount(ctx, &ledgerv1.FreezeAccountRequest{
+		// 1. Send gRPC call to Core Ledger to Freeze Account immediately (with propagated trace context)
+		freezeResp, freezeErr := c.ledgerClient.FreezeAccount(telemetry.InjectGRPC(ctx), &ledgerv1.FreezeAccountRequest{
 			AccountNumber: result.AccountNumber,
 			Reason:        result.Reason,
 		})

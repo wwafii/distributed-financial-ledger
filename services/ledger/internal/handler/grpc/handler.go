@@ -6,6 +6,7 @@ import (
 
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	"github.com/wwafii/distributed-financial-ledger/pkg/errs"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/domain"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/repository/postgres"
 	"google.golang.org/grpc/codes"
@@ -22,6 +23,11 @@ func NewLedgerHandler(repo *postgres.LedgerRepository) *LedgerHandler {
 }
 
 func (h *LedgerHandler) CreateTransaction(ctx context.Context, req *ledgerv1.CreateTransactionRequest) (*ledgerv1.CreateTransactionResponse, error) {
+	ctx = telemetry.ExtractGRPC(ctx)
+	tracer := telemetry.Tracer("ledger-service")
+	ctx, span := tracer.Start(ctx, "gRPC CreateTransaction")
+	defer span.End()
+
 	if req.ReferenceId == "" {
 		return nil, status.Error(codes.InvalidArgument, "reference_id is required")
 	}
@@ -61,6 +67,8 @@ func (h *LedgerHandler) CreateTransaction(ctx context.Context, req *ledgerv1.Cre
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
+	telemetry.TransactionsTotal.WithLabelValues("POSTED").Inc()
+
 	return &ledgerv1.CreateTransactionResponse{
 		TransactionId: tx.ID.String(),
 		ReferenceId:   tx.ReferenceID,
@@ -70,6 +78,11 @@ func (h *LedgerHandler) CreateTransaction(ctx context.Context, req *ledgerv1.Cre
 }
 
 func (h *LedgerHandler) GetAccountBalance(ctx context.Context, req *ledgerv1.GetAccountBalanceRequest) (*ledgerv1.GetAccountBalanceResponse, error) {
+	ctx = telemetry.ExtractGRPC(ctx)
+	tracer := telemetry.Tracer("ledger-service")
+	ctx, span := tracer.Start(ctx, "gRPC GetAccountBalance")
+	defer span.End()
+
 	if req.AccountNumber == "" {
 		return nil, status.Error(codes.InvalidArgument, "account_number is required")
 	}
@@ -93,6 +106,11 @@ func (h *LedgerHandler) GetAccountBalance(ctx context.Context, req *ledgerv1.Get
 }
 
 func (h *LedgerHandler) FreezeAccount(ctx context.Context, req *ledgerv1.FreezeAccountRequest) (*ledgerv1.FreezeAccountResponse, error) {
+	ctx = telemetry.ExtractGRPC(ctx)
+	tracer := telemetry.Tracer("ledger-service")
+	ctx, span := tracer.Start(ctx, "gRPC FreezeAccount")
+	defer span.End()
+
 	if req.AccountNumber == "" {
 		return nil, status.Error(codes.InvalidArgument, "account_number is required")
 	}

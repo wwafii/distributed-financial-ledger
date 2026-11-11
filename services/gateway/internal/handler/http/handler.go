@@ -8,6 +8,7 @@ import (
 	"time"
 
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/gateway/internal/idempotency"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -53,7 +54,11 @@ func writeJSON(w http.ResponseWriter, statusCode int, data interface{}) {
 
 // HandleCreateTransaction handles financial transfers protected by Idempotency-Key
 func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := telemetry.ExtractHTTP(r)
+	tracer := telemetry.Tracer("api-gateway")
+	ctx, span := tracer.Start(ctx, "HTTP POST /api/v1/transactions")
+	defer span.End()
+
 	idempKey := r.Header.Get("Idempotency-Key")
 
 	if idempKey == "" {
@@ -132,7 +137,7 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		Description:                reqBody.Description,
 	}
 
-	grpcResp, err := h.ledgerClient.CreateTransaction(ctx, grpcReq)
+	grpcResp, err := h.ledgerClient.CreateTransaction(telemetry.InjectGRPC(ctx), grpcReq)
 	if err != nil {
 		_ = h.idempEngine.Release(ctx, idempKey)
 		grpcStatus, _ := status.FromError(err)
@@ -180,13 +185,18 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 
 // HandleGetBalance retrieves current balance from ledger
 func (h *GatewayHandler) HandleGetBalance(w http.ResponseWriter, r *http.Request) {
+	ctx := telemetry.ExtractHTTP(r)
+	tracer := telemetry.Tracer("api-gateway")
+	ctx, span := tracer.Start(ctx, "HTTP GET /api/v1/accounts/balance")
+	defer span.End()
+
 	accNum := r.PathValue("account_number")
 	if accNum == "" {
 		writeJSON(w, http.StatusBadRequest, StandardResponse{Success: false, Error: "Missing account_number"})
 		return
 	}
 
-	grpcResp, err := h.ledgerClient.GetAccountBalance(r.Context(), &ledgerv1.GetAccountBalanceRequest{
+	grpcResp, err := h.ledgerClient.GetAccountBalance(telemetry.InjectGRPC(ctx), &ledgerv1.GetAccountBalanceRequest{
 		AccountNumber: accNum,
 	})
 	if err != nil {
@@ -214,13 +224,18 @@ func (h *GatewayHandler) HandleGetBalance(w http.ResponseWriter, r *http.Request
 
 // HandleFreezeAccount freezes an account manually or via rule
 func (h *GatewayHandler) HandleFreezeAccount(w http.ResponseWriter, r *http.Request) {
+	ctx := telemetry.ExtractHTTP(r)
+	tracer := telemetry.Tracer("api-gateway")
+	ctx, span := tracer.Start(ctx, "HTTP POST /api/v1/accounts/freeze")
+	defer span.End()
+
 	accNum := r.PathValue("account_number")
 	if accNum == "" {
 		writeJSON(w, http.StatusBadRequest, StandardResponse{Success: false, Error: "Missing account_number"})
 		return
 	}
 
-	grpcResp, err := h.ledgerClient.FreezeAccount(r.Context(), &ledgerv1.FreezeAccountRequest{
+	grpcResp, err := h.ledgerClient.FreezeAccount(telemetry.InjectGRPC(ctx), &ledgerv1.FreezeAccountRequest{
 		AccountNumber: accNum,
 		Reason:        "Manual freeze from gateway",
 	})

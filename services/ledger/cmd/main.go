@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	pkgkafka "github.com/wwafii/distributed-financial-ledger/pkg/kafka"
 	"github.com/wwafii/distributed-financial-ledger/pkg/logger"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	grpchandler "github.com/wwafii/distributed-financial-ledger/services/ledger/internal/handler/grpc"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/repository/postgres"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/worker"
@@ -38,6 +40,16 @@ func main() {
 	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
 	if kafkaBrokers == "" {
 		kafkaBrokers = "localhost:9094"
+	}
+
+	jaegerEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if jaegerEndpoint == "" {
+		jaegerEndpoint = "localhost:4317"
+	}
+
+	shutdownTracer, err := telemetry.InitTracer(context.Background(), "ledger-service", jaegerEndpoint, log)
+	if err == nil {
+		defer shutdownTracer(context.Background())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -89,6 +101,20 @@ func main() {
 	grpcServer := grpc.NewServer()
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, handler)
 	reflection.Register(grpcServer)
+
+	// 3. Start Prometheus Metrics HTTP Server on :9111
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9111"
+	}
+	metricsServer := telemetry.NewMetricsServer(metricsPort)
+	go func() {
+		log.Info("ledger metrics server listening", "port", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("ledger metrics server error", "error", err)
+		}
+	}()
+	defer metricsServer.Close()
 
 	go func() {
 		log.Info("gRPC server listening", "port", grpcPort)

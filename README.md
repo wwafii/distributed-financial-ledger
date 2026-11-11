@@ -194,44 +194,56 @@ flowchart LR
 ---
 
 ### 🔹 Fase 4: Real-Time Fraud & Anomaly Engine
-*Tujuan: Mendeteksi indikasi fraud dalam stream data dengan latensi < 5ms.*
+*Tujuan: Mendeteksi indikasi fraud dalam stream data dengan latensi < 5ms tanpa mengorbankan pengalaman nasabah sah.*
 1. **Kafka Consumer Group:**
    * Fraud Engine mendengarkan event stream `transaction.created`.
-2. **Sliding-Window Velocity Check di Redis:**
-   * Gunakan Redis **Sorted Sets (ZSET)**.
-   * Setiap ada transaksi, masukkan timestamp sebagai *score* (`ZADD`).
-   * Bersihkan data lama di luar jendela waktu (`ZREMRANGEBYSCORE`).
-   * Hitung frekuensi transaksi user dalam 60 detik terakhir (`ZCARD`).
-3. **Rule Evaluator:**
-   * Jika user melakukan > 5 transaksi dalam 60 detik, atau total nominal melebihi batas batas ambang:
-   * Terbitkan event `fraud.flagged` dan kirim instruksi gRPC ke Ledger Service untuk membekukan akun (`status = FROZEN`).
+2. **Multi-Tier Sliding-Window Velocity Check di Redis (ZSET):**
+   * Gunakan Redis **Sorted Sets (ZSET)** (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD`, `ZCOUNT`, `ZRANGE`).
+   * Eksekusi *atomic pipeline* di memori RAM dengan latensi sub-2ms.
+   * **Anti-Bot Burst Window (10s):** Deteksi serangan skrip bot jika terjadi > 3 transaksi dalam 10 detik (melanggar batas biologis manusia).
+   * **Cumulative Volume Window (60s):** Deteksi pencucian uang/pengurasan bertahap (*structuring/smurfing*) jika total akumulasi > Rp 100 Juta dalam 1 menit.
+   * **Sustained Velocity Window (60s):** Toleransi wajar hingga 10 transaksi per menit untuk nasabah retail dan merchant.
+3. **Advanced Action Matrix & Risk Decisioning (FAANG/Banking Standard):**
+   * Alih-alih pembekuan biner yang kaku, sistem menerapkan respon adaptif bertingkat:
+     * `ACTION_ALLOW` (Risk Score: 10): Transaksi bersih, lolos seketika tanpa hambatan.
+     * `ACTION_CHALLENGE` (Risk Score: 50): Transaksi bernominal besar/jumbo (misal: beli mobil/properti $\ge$ Rp 50 Juta). **Akun TIDAK dibekukan**, melainkan sistem menerbitkan event `fraud.challenge_required` ke Kafka untuk meminta verifikasi biometrik wajah / OTP 2FA.
+     * `ACTION_HOLD` (Risk Score: 65): Transaksi pecah-pecah bertahap yang melewati batas volume kumulatif. **Akun TIDAK dibekukan**, melainkan transaksi ditahan sementara (10 menit) dan diterbitkan event `fraud.review_hold` ke Kafka untuk konfirmasi nasabah.
+     * `ACTION_FREEZE` (Risk Score: 85 - 95): Serangan bot kilat atau sustained velocity ekstrim. Sistem langsung menembak panggilan gRPC `FreezeAccount` ke Core Ledger untuk mengunci akun seketika dan menerbitkan event audit `fraud.flagged`.
+4. **12-Factor Dynamic Configuration:**
+   * Seluruh parameter ambang batas (`FRAUD_WINDOW_DURATION_SEC`, `FRAUD_MAX_IN_WINDOW`, `FRAUD_BURST_WINDOW_SEC`, `FRAUD_MAX_BURST`, `FRAUD_CUMULATIVE_AMOUNT_THRESHOLD`, `FRAUD_HIGH_AMOUNT_THRESHOLD`) dapat disetel secara dinamis via Environment Variables tanpa kompilasi ulang.
 
 ---
 
 ### 🔹 Fase 5: Resilient Notification Worker & Dead Letter Queue (DLQ)
-*Tujuan: Menangani kegagalan integrasi pihak ketiga secara elegan tanpa kehilangan data.*
-1. **Consumer Worker Pool:**
-   * Worker memproses event untuk mengirim simulasi webhook ke merchant luar.
-2. **Exponential Backoff & Retries:**
-   * Jika webhook eksternal gagal/timeout (HTTP 500/504), lakukan retry terjadwal (misal: jeda 1s, 2s, 4s).
+*Tujuan: Menangani kegagalan integrasi pihak ketiga secara elegan tanpa kehilangan data dan tanpa memblokir antrean event.*
+1. **Consumer Worker Pool (`services/notification`):**
+   * Worker memproses event stream `transaction.created` untuk mengirim webhook HTTP POST ke sistem luar / merchant.
+2. **Error Classification & Exponential Backoff:**
+   * Klasifikasi error pintar: membedakan antara *Transient Failure* (`RetryableError`: HTTP 5xx, timeout, network error) vs *Permanent Client Failure* (`NonRetryableError`: HTTP 4xx Bad Request).
+   * Melakukan retry otomatis dengan *exponential backoff* dan jeda waktu bertingkat (misal: jeda 500ms, 1s, 2s).
+   * Pada kegagalan *non-retryable*, sistem langsung menghentikan percobaan agar tidak membuang resource secara sia-sia.
 3. **Dead Letter Queue (DLQ):**
-   * Jika setelah 3x retry masih gagal, kirim pesan tersebut ke topik Kafka `transaction.dlq` untuk dianalisis oleh engineer tanpa memblokir antrean pesan lainnya.
+   * Jika seluruh kuota retry habis (default: 3x retry = 4 percobaan total) atau terjadi error fatal, pesan dialihkan ke topik Kafka `transaction.dlq`.
+   * Struktur pesan DLQ membungkus: `original_topic`, `original_key`, `payload`, `error_reason`, `retry_count`, dan `failed_at`.
+   * Offset partisi Kafka utama tetap di-*commit* sehingga *poison message* tidak pernah menimbulkan *Head-of-Line Blocking* bagi transaksi nasabah lainnya.
 
 ---
 
 ### 🔹 Fase 6: Production-Grade Observability (OpenTelemetry, Prometheus & Grafana)
-*Tujuan: Membuka "mata" terhadap seluruh alur data yang melintasi batas jaringan.*
-1. **Distributed Tracing (OpenTelemetry):**
-   * Injeksi W3C `traceparent` pada HTTP Gateway $\to$ teruskan via gRPC metadata $\to$ injeksi ke Kafka Message Header $\to$ ekstrak di Fraud & Notification Consumer.
-   * Pastikan satu user request menghasilkan **satu Trace ID utuh** yang bisa diinspeksi di Jaeger UI.
-2. **Prometheus Metrics:**
-   * Instrumentasi metrik penting:
-     * `http_requests_total` (labeled by method, status)
-     * `transaction_duration_seconds` (Histogram P50, P95, P99)
-     * `fraud_detected_total`
-     * `kafka_consumer_lag`
-3. **Grafana Dashboards:**
-   * Siapkan dashboard JSON siap pakai untuk memantau performa cluster.
+*Tujuan: Membuka visibilitas menyeluruh terhadap seluruh alur data yang melintasi batas jaringan microservices.*
+1. **End-to-End Distributed Tracing (OpenTelemetry + Jaeger):**
+   * Paket utilitas sentral di `pkg/telemetry/`.
+   * Standardisasi W3C Trace Context (`traceparent` header).
+   * **Full Trace Lifecycle:** Ekstrak W3C pada HTTP Gateway $\to$ Injeksi ke internal gRPC metadata $\to$ Ekstrak di Core Ledger $\to$ Injeksi ke header partisi Kafka saat Outbox dispatch $\to$ Ekstrak di Fraud Engine & Notification Worker.
+   * Satu request transfer dari client menghasilkan **satu Trace ID tunggal** yang memvisualisasikan seluruh perjalanan transaksi di Jaeger UI (`:16686`).
+   * *Graceful Fallback:* Jika OTLP Jaeger sedang offline, tracer otomatis beralih ke *Noop Tracer* tanpa menyebabkan *panic* atau *crash*.
+2. **Prometheus Metrics Instrumentation:**
+   * Eksposur metrik produksi di setiap service:
+     * API Gateway (`:8000/metrics`): `http_requests_total`, `http_request_duration_seconds`.
+     * Core Ledger (`:9111/metrics`): `ledger_transactions_total` (labeled by status: `POSTED`).
+     * Fraud Engine (`:9102/metrics`): `fraud_evaluations_total` (labeled by action: `ALLOW`, `CHALLENGE`, `HOLD`, `FREEZE`).
+     * Notification Worker (`:9103/metrics`): `notifications_dispatched_total`, `notification_retries_total`, `notification_dlq_total`.
+   * `deployments/prometheus.yml` sudah dikonfigurasi untuk men-scrape keempat endpoint service secara periodik.
 
 ---
 

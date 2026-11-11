@@ -9,9 +9,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	"github.com/wwafii/distributed-financial-ledger/pkg/logger"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	httphandler "github.com/wwafii/distributed-financial-ledger/services/gateway/internal/handler/http"
 	"github.com/wwafii/distributed-financial-ledger/services/gateway/internal/idempotency"
 	"google.golang.org/grpc"
@@ -35,6 +37,16 @@ func main() {
 	ledgerGRPCAddr := os.Getenv("LEDGER_GRPC_ADDR")
 	if ledgerGRPCAddr == "" {
 		ledgerGRPCAddr = "localhost:9101"
+	}
+
+	jaegerEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if jaegerEndpoint == "" {
+		jaegerEndpoint = "localhost:4317"
+	}
+
+	shutdownTracer, err := telemetry.InitTracer(context.Background(), "api-gateway", jaegerEndpoint, log)
+	if err == nil {
+		defer shutdownTracer(context.Background())
 	}
 
 	// 1. Connect to Redis
@@ -72,10 +84,11 @@ func main() {
 	mux.HandleFunc("GET /api/v1/accounts/{account_number}/balance", handler.HandleGetBalance)
 	mux.HandleFunc("POST /api/v1/accounts/{account_number}/freeze", handler.HandleFreezeAccount)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", httpPort),
-		Handler:      mux,
+		Handler:      telemetry.MetricsMiddleware(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,

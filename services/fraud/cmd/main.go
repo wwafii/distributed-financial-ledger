@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	pkgkafka "github.com/wwafii/distributed-financial-ledger/pkg/kafka"
 	"github.com/wwafii/distributed-financial-ledger/pkg/logger"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/fraud/internal/consumer"
 	"github.com/wwafii/distributed-financial-ledger/services/fraud/internal/evaluator"
 	"google.golang.org/grpc"
@@ -47,6 +49,30 @@ func main() {
 	if kafkaGroupID == "" {
 		kafkaGroupID = "fraud-engine-v1"
 	}
+
+	jaegerEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if jaegerEndpoint == "" {
+		jaegerEndpoint = "localhost:4317"
+	}
+
+	shutdownTracer, err := telemetry.InitTracer(context.Background(), "fraud-service", jaegerEndpoint, log)
+	if err == nil {
+		defer shutdownTracer(context.Background())
+	}
+
+	// Start Prometheus Metrics HTTP Server on :9102
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9102"
+	}
+	metricsServer := telemetry.NewMetricsServer(metricsPort)
+	go func() {
+		log.Info("fraud metrics server listening", "port", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("fraud metrics server error", "error", err)
+		}
+	}()
+	defer metricsServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

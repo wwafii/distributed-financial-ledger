@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 )
 
 // EventPublisher abstracts the message broker dispatch
@@ -13,7 +14,7 @@ type EventPublisher interface {
 	Close() error
 }
 
-// KafkaPublisher implements EventPublisher using segmentio/kafka-go Writer
+// KafkaPublisher implements EventPublisher using segmentio/kafka-go Writer with OTel trace propagation
 type KafkaPublisher struct {
 	writer *kafka.Writer
 }
@@ -35,6 +36,10 @@ func (p *KafkaPublisher) Publish(ctx context.Context, topic string, key string, 
 		Value: payload,
 		Time:  time.Now(),
 	}
+
+	// Propagate W3C distributed trace context across Kafka partitions
+	telemetry.InjectKafka(ctx, &msg)
+
 	return p.writer.WriteMessages(ctx, msg)
 }
 

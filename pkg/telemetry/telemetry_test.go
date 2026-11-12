@@ -70,6 +70,25 @@ func TestW3CPropagation_GRPC(t *testing.T) {
 	}
 }
 
+func TestW3CPropagation_Map(t *testing.T) {
+	_, _ = telemetry.InitTracer(context.Background(), "test-map", "localhost:4317", nil)
+
+	tracer := telemetry.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "test-map-span")
+	defer span.End()
+
+	mapData := telemetry.InjectMap(ctx)
+	if len(mapData) == 0 {
+		t.Fatalf("expected map data to contain traceparent")
+	}
+
+	extractedCtx := telemetry.ExtractMap(context.Background(), mapData)
+	extractedSpan := trace.SpanFromContext(extractedCtx)
+	if !extractedSpan.SpanContext().IsValid() {
+		t.Fatalf("expected valid span context extracted from map")
+	}
+}
+
 func TestMetricsMiddleware(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

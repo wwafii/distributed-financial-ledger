@@ -226,3 +226,58 @@ func TestNotificationConsumer_NonRetryable_ImmediatelyRoutesToDLQ(t *testing.T) 
 		t.Fatalf("expected 1 message published to DLQ, got %d", len(pub.publishedList))
 	}
 }
+
+func TestDefaultEqualJitter(t *testing.T) {
+	baseDuration := 1000 * time.Millisecond
+	half := baseDuration / 2
+
+	for i := 0; i < 50; i++ {
+		jittered := consumer.DefaultEqualJitter(baseDuration)
+		if jittered < half || jittered > baseDuration {
+			t.Errorf("jittered duration %v should be between %v and %v", jittered, half, baseDuration)
+		}
+	}
+
+	// Edge case: zero or negative duration
+	if res := consumer.DefaultEqualJitter(0); res != 0 {
+		t.Errorf("expected 0 for zero duration, got %v", res)
+	}
+}
+
+func TestNotificationConsumer_UsesCustomJitter(t *testing.T) {
+	log := logger.New("test-notif", nil)
+	client := &mockWebhookClient{
+		failCount:   1,
+		errToReturn: &sender.RetryableError{Err: errors.New("temporary failure")},
+	}
+	pub := &mockDLQPublisher{}
+
+	var receivedSleep time.Duration
+	cfg := consumer.DefaultConfig()
+	cfg.MaxRetries = 1
+	cfg.InitialBackoff = 200 * time.Millisecond
+	cfg.JitterFn = func(d time.Duration) time.Duration {
+		return d + 42*time.Millisecond
+	}
+	cfg.SleepFn = func(d time.Duration) {
+		receivedSleep = d
+	}
+
+	c := consumer.NewNotificationConsumer(nil, client, pub, log, cfg)
+
+	msg := kafka.Message{
+		Topic: "transaction.created",
+		Key:   []byte("tx-jitter"),
+		Value: []byte(`{}`),
+	}
+
+	err := c.ProcessMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedSleep := 200*time.Millisecond + 42*time.Millisecond
+	if receivedSleep != expectedSleep {
+		t.Errorf("expected sleep with custom jitter %v, got %v", expectedSleep, receivedSleep)
+	}
+}

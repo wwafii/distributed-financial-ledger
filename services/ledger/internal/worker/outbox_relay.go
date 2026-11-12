@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	pkgkafka "github.com/wwafii/distributed-financial-ledger/pkg/kafka"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 )
 
 // OutboxRelayConfig holds configuration for polling relay
@@ -100,8 +102,28 @@ func (r *OutboxRelay) ProcessBatch(ctx context.Context) (int, error) {
 	}
 
 	for _, item := range items {
+		// Extract incoming W3C trace context from outbox event payload if available
+		publishCtx := ctx
+		var payloadMap map[string]interface{}
+		if err := json.Unmarshal(item.Payload, &payloadMap); err == nil {
+			if traceCtxRaw, ok := payloadMap["trace_context"].(map[string]interface{}); ok {
+				traceMap := make(map[string]string, len(traceCtxRaw))
+				for k, v := range traceCtxRaw {
+					if strVal, isStr := v.(string); isStr {
+						traceMap[k] = strVal
+					}
+				}
+				publishCtx = telemetry.ExtractMap(ctx, traceMap)
+			}
+		}
+
+		tracer := telemetry.Tracer("outbox-relay")
+		publishCtx, span := tracer.Start(publishCtx, "Outbox Relay Publish: "+item.EventType)
+
 		// Publish event to Kafka
-		publishErr := r.publisher.Publish(ctx, item.EventType, item.AggregateID, item.Payload)
+		publishErr := r.publisher.Publish(publishCtx, item.EventType, item.AggregateID, item.Payload)
+		span.End()
+
 		if publishErr != nil {
 			r.logger.Error("failed to publish outbox event",
 				"event_id", item.ID,

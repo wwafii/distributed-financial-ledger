@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -18,14 +20,32 @@ import (
 	"github.com/wwafii/distributed-financial-ledger/services/notification/internal/sender"
 )
 
-// NotificationConfig holds backoff and routing configuration for notification worker
+// DefaultEqualJitter applies AWS Equal Jitter to eliminate thundering herd:
+// sleep = (backoff / 2) + rand(0, backoff / 2)
+// This guarantees sleep is within [0.5 * backoff, 1.0 * backoff],
+// preventing traffic stampedes while maintaining monotonic progression across retry attempts.
+func DefaultEqualJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	half := d / 2
+	if half <= 0 {
+		return d
+	}
+	jitter := time.Duration(rand.Int64N(int64(half)))
+	return half + jitter
+}
+
+// NotificationConfig holds backoff, routing, and concurrency configuration for notification worker
 type NotificationConfig struct {
 	MaxRetries        int
 	InitialBackoff    time.Duration
 	BackoffMultiplier float64
 	WebhookURL        string
 	DLQTopic          string
-	SleepFn           func(d time.Duration) // for testability without real delay
+	SleepFn           func(d time.Duration)               // for testability without real delay
+	JitterFn          func(d time.Duration) time.Duration // full/equal jitter function
+	WorkerPoolSize    int                                 // concurrent worker pool size
 }
 
 // DefaultConfig provides production-grade resilience defaults
@@ -37,6 +57,8 @@ func DefaultConfig() NotificationConfig {
 		WebhookURL:        "http://localhost:8088/api/v1/webhook",
 		DLQTopic:          "transaction.dlq",
 		SleepFn:           time.Sleep,
+		JitterFn:          DefaultEqualJitter,
+		WorkerPoolSize:    5,
 	}
 }
 
@@ -52,6 +74,11 @@ func ConfigFromEnv() NotificationConfig {
 	if val := os.Getenv("NOTIFICATION_INITIAL_BACKOFF_MS"); val != "" {
 		if ms, err := strconv.Atoi(val); err == nil && ms > 0 {
 			cfg.InitialBackoff = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if val := os.Getenv("NOTIFICATION_CONCURRENCY"); val != "" {
+		if c, err := strconv.Atoi(val); err == nil && c > 0 {
+			cfg.WorkerPoolSize = c
 		}
 	}
 	if val := os.Getenv("WEBHOOK_TARGET_URL"); val != "" {
@@ -81,6 +108,12 @@ func NewNotificationConsumer(
 ) *NotificationConsumer {
 	if cfg.SleepFn == nil {
 		cfg.SleepFn = time.Sleep
+	}
+	if cfg.JitterFn == nil {
+		cfg.JitterFn = DefaultEqualJitter
+	}
+	if cfg.WorkerPoolSize <= 0 {
+		cfg.WorkerPoolSize = 5
 	}
 	return &NotificationConsumer{
 		reader:    reader,
@@ -128,14 +161,20 @@ func (c *NotificationConsumer) ProcessMessage(ctx context.Context, msg kafka.Mes
 			break
 		}
 
-		// If transient failure and we have remaining attempts, backoff and retry
+		// If transient failure and we have remaining attempts, backoff with jitter and retry
 		if attempt < c.cfg.MaxRetries {
 			telemetry.NotificationRetriesTotal.Inc()
-			backoff := time.Duration(float64(c.cfg.InitialBackoff) * math.Pow(c.cfg.BackoffMultiplier, float64(attempt)))
-			c.logger.Warn("transient webhook failure, scheduling exponential retry",
+			baseBackoff := time.Duration(float64(c.cfg.InitialBackoff) * math.Pow(c.cfg.BackoffMultiplier, float64(attempt)))
+			backoff := baseBackoff
+			if c.cfg.JitterFn != nil {
+				backoff = c.cfg.JitterFn(baseBackoff)
+			}
+
+			c.logger.Warn("transient webhook failure, scheduling exponential retry with jitter",
 				"attempt", attempts,
 				"max_retries", c.cfg.MaxRetries,
-				"backoff", backoff.String(),
+				"base_backoff", baseBackoff.String(),
+				"jittered_backoff", backoff.String(),
 				"error", err,
 			)
 			c.cfg.SleepFn(backoff)
@@ -182,32 +221,53 @@ func (c *NotificationConsumer) ProcessMessage(ctx context.Context, msg kafka.Mes
 	return nil
 }
 
-// Start begins consuming Kafka messages until context cancellation
+// Start begins consuming Kafka messages with a concurrent worker pool until context cancellation
 func (c *NotificationConsumer) Start(ctx context.Context) {
-	c.logger.Info("notification worker started, consuming from Kafka topic...",
+	c.logger.Info("notification worker pool started, consuming from Kafka topic...",
 		"topic", c.reader.Config().Topic,
 		"dlq_topic", c.cfg.DLQTopic,
+		"concurrency", c.cfg.WorkerPoolSize,
 	)
+
+	sem := make(chan struct{}, c.cfg.WorkerPoolSize)
+	var wg sync.WaitGroup
 
 	for {
 		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
-				c.logger.Info("notification consumer stopped cleanly")
-				return
+				c.logger.Info("notification consumer stopped cleanly, draining workers...")
+				break
 			}
 			c.logger.Error("error fetching kafka message in notification worker", "error", err)
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
-		if err := c.ProcessMessage(ctx, msg); err != nil {
-			c.logger.Error("error processing notification message", "error", err)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break
 		}
 
-		// Always commit message offset after delivery OR DLQ routing to prevent partition blocking
-		if err := c.reader.CommitMessages(ctx, msg); err != nil {
-			c.logger.Error("failed to commit kafka offset in notification worker", "error", err)
-		}
+		wg.Add(1)
+		go func(m kafka.Message) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			if err := c.ProcessMessage(ctx, m); err != nil {
+				c.logger.Error("error processing notification message", "error", err)
+			}
+
+			// Always commit message offset after delivery OR DLQ routing to prevent partition blocking
+			if err := c.reader.CommitMessages(ctx, m); err != nil {
+				c.logger.Error("failed to commit kafka offset in notification worker", "error", err)
+			}
+		}(msg)
 	}
+
+	wg.Wait()
+	c.logger.Info("notification worker pool fully drained")
 }

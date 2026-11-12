@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wwafii/distributed-financial-ledger/pkg/errs"
+	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/domain"
 )
 
@@ -198,6 +199,7 @@ func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.Tran
 		"currency":            cmd.Currency,
 		"description":         cmd.Description,
 		"timestamp":           createdAt.Format(time.RFC3339),
+		"trace_context":       telemetry.InjectMap(ctx),
 	}
 	payloadBytes, err := json.Marshal(eventPayload)
 	if err != nil {

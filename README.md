@@ -108,7 +108,9 @@ flowchart TD
 │   │   ├── cmd/main.go
 │   │   └── internal/
 │   └── notification/              # Async Consumer & DLQ
-│       ├── cmd/main.go
+│       ├── cmd/
+│       │   ├── main.go
+│       │   └── redrive/main.go    # SRE DLQ Replay CLI Tool
 │       └── internal/
 ├── pkg/                           # Shared internal libraries (anti-bloat)
 │   ├── telemetry/                 # OpenTelemetry Tracer & Meter setup
@@ -216,16 +218,25 @@ flowchart LR
 
 ### 🔹 Fase 5: Resilient Notification Worker & Dead Letter Queue (DLQ)
 *Tujuan: Menangani kegagalan integrasi pihak ketiga secara elegan tanpa kehilangan data dan tanpa memblokir antrean event.*
-1. **Consumer Worker Pool (`services/notification`):**
-   * Worker memproses event stream `transaction.created` untuk mengirim webhook HTTP POST ke sistem luar / merchant.
-2. **Error Classification & Exponential Backoff:**
+1. **Concurrent Worker Pool (`services/notification`):**
+   * Worker memproses event stream `transaction.created` menggunakan armada paralel (*Goroutine Semaphore Worker Pool*, default: 5 worker concurrency).
+   * Dilengkapi *Graceful Drain* (`sync.WaitGroup`) sehingga saat proses shutdown, webhook yang sedang in-flight diselesaikan tuntas sebelum exit.
+2. **Error Classification & AWS Equal Jitter Exponential Backoff:**
    * Klasifikasi error pintar: membedakan antara *Transient Failure* (`RetryableError`: HTTP 5xx, timeout, network error) vs *Permanent Client Failure* (`NonRetryableError`: HTTP 4xx Bad Request).
-   * Melakukan retry otomatis dengan *exponential backoff* dan jeda waktu bertingkat (misal: jeda 500ms, 1s, 2s).
+   * Menerapkan algoritma **AWS Equal Jitter**:
+     $$\text{sleep} = \frac{\text{backoff}}{2} + \text{rand}\left(0, \frac{\text{backoff}}{2}\right)$$
+     Mereduksi risiko *Thundering Herd Problem* / *Self-DDoS* saat ribuan webhook gagal bersamaan.
    * Pada kegagalan *non-retryable*, sistem langsung menghentikan percobaan agar tidak membuang resource secara sia-sia.
 3. **Dead Letter Queue (DLQ):**
    * Jika seluruh kuota retry habis (default: 3x retry = 4 percobaan total) atau terjadi error fatal, pesan dialihkan ke topik Kafka `transaction.dlq`.
    * Struktur pesan DLQ membungkus: `original_topic`, `original_key`, `payload`, `error_reason`, `retry_count`, dan `failed_at`.
    * Offset partisi Kafka utama tetap di-*commit* sehingga *poison message* tidak pernah menimbulkan *Head-of-Line Blocking* bagi transaksi nasabah lainnya.
+4. **DLQ Re-drive Engine & Standalone CLI Tool:**
+   * Menyediakan modul `DLQRedriver` ([`services/notification/internal/consumer/redrive.go`](./services/notification/internal/consumer/redrive.go)) dan CLI tool mandiri ([`services/notification/cmd/redrive/main.go`](./services/notification/cmd/redrive/main.go)).
+   * Memungkinkan tim SRE memutar ulang (*replay*) pesan yang tertahan di `transaction.dlq` kembali ke topik aktif `transaction.created` setelah server pihak ketiga dipastikan normal kembali:
+     ```bash
+     go run ./services/notification/cmd/redrive -dlq-topic=transaction.dlq -max=500
+     ```
 
 ---
 
@@ -234,8 +245,8 @@ flowchart LR
 1. **End-to-End Distributed Tracing (OpenTelemetry + Jaeger):**
    * Paket utilitas sentral di `pkg/telemetry/`.
    * Standardisasi W3C Trace Context (`traceparent` header).
-   * **Full Trace Lifecycle:** Ekstrak W3C pada HTTP Gateway $\to$ Injeksi ke internal gRPC metadata $\to$ Ekstrak di Core Ledger $\to$ Injeksi ke header partisi Kafka saat Outbox dispatch $\to$ Ekstrak di Fraud Engine & Notification Worker.
-   * Satu request transfer dari client menghasilkan **satu Trace ID tunggal** yang memvisualisasikan seluruh perjalanan transaksi di Jaeger UI (`:16686`).
+   * **Full Trace Lifecycle Across Boundaries:** Ekstrak W3C pada HTTP Gateway $\to$ Injeksi ke internal gRPC metadata $\to$ Ekstrak di Core Ledger $\to$ **Persistensi W3C TraceContext ke tabel PostgreSQL `outbox_events` (JSON payload)** $\to$ Ekstrak di Outbox Relay Worker $\to$ Injeksi ke header Kafka partition $\to$ Ekstrak di Fraud Engine & Notification Worker.
+   * Satu request transfer dari client menghasilkan **satu Trace ID tunggal** yang memvisualisasikan seluruh perjalanan transaksi di Jaeger UI (`:16686`) tanpa terputus di level database outbox.
    * *Graceful Fallback:* Jika OTLP Jaeger sedang offline, tracer otomatis beralih ke *Noop Tracer* tanpa menyebabkan *panic* atau *crash*.
 2. **Prometheus Metrics Instrumentation:**
    * Eksposur metrik produksi di setiap service:

@@ -135,3 +135,23 @@ func ExtractKafka(ctx context.Context, msg *kafka.Message) context.Context {
 	carrier := kafkaHeaderCarrier{headers: &msg.Headers}
 	return otel.GetTextMapPropagator().Extract(ctx, carrier)
 }
+
+// -----------------------------------------------------------------------------
+// 4. Map Propagation Helpers (e.g. for JSON database outbox records)
+// -----------------------------------------------------------------------------
+
+// InjectMap serializes W3C trace context into a string map suitable for JSON payloads
+func InjectMap(ctx context.Context) map[string]string {
+	carrier := make(propagation.MapCarrier)
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	return map[string]string(carrier)
+}
+
+// ExtractMap deserializes W3C trace context from a string map
+func ExtractMap(ctx context.Context, m map[string]string) context.Context {
+	if m == nil {
+		return ctx
+	}
+	carrier := propagation.MapCarrier(m)
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}

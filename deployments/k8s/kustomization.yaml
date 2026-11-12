@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: distributed-ledger
+
+resources:
+  # 1. Shared Infrastructure & Config
+  - shared/namespace.yaml
+  - shared/configmap.yaml
+  - shared/secrets.yaml
+  - shared/ingress.yaml
+
+  # 2. API Gateway
+  - gateway/deployment.yaml
+  - gateway/service.yaml
+  - gateway/hpa.yaml
+
+  # 3. Core Ledger
+  - ledger/deployment.yaml
+  - ledger/service.yaml
+
+  # 4. Real-time Fraud Engine
+  - fraud/deployment.yaml
+  - fraud/service.yaml
+  - fraud/hpa.yaml
+
+  # 5. Resilient Notification Worker
+  - notification/deployment.yaml
+  - notification/service.yaml
+
+commonLabels:
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/part-of: distributed-financial-ledger

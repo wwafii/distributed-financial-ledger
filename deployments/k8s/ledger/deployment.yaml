@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-service
+  namespace: distributed-ledger
+  labels:
+    app.kubernetes.io/name: ledger-service
+    app.kubernetes.io/component: core-ledger
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9111"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: ledger
+          image: distributed-ledger/ledger:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9101
+            - name: metrics
+              containerPort: 9111
+          envFrom:
+            - configMapRef:
+                name: ledger-config
+            - secretRef:
+                name: ledger-secrets
+          env:
+            - name: METRICS_PORT
+              value: "9111"
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9111
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9111
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2

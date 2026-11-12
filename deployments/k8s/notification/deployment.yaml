@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: distributed-ledger
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/component: notification-worker
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notification-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notification-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9103"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: notification
+          image: distributed-ledger/notification:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9103
+          envFrom:
+            - configMapRef:
+                name: ledger-config
+          env:
+            - name: METRICS_PORT
+              value: "9103"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9103
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9103
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2

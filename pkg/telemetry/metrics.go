@@ -107,10 +107,15 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// NewMetricsServer returns an HTTP server dedicated to serving /metrics
+// NewMetricsServer returns an HTTP server dedicated to serving /metrics and /healthz
 func NewMetricsServer(port string) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 
 	return &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),

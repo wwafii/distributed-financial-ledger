@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledger-config
+  namespace: distributed-ledger
+data:
+  HTTP_PORT: "8000"
+  GRPC_PORT: "9101"
+  METRICS_PORT_GATEWAY: "8000"
+  METRICS_PORT_LEDGER: "9111"
+  METRICS_PORT_FRAUD: "9102"
+  METRICS_PORT_NOTIFICATION: "9103"
+  
+  REDIS_ADDR: "redis-service.distributed-ledger.svc.cluster.local:6379"
+  LEDGER_GRPC_ADDR: "ledger-service.distributed-ledger.svc.cluster.local:9101"
+  KAFKA_BROKERS: "redpanda-service.distributed-ledger.svc.cluster.local:9092"
+  KAFKA_TOPIC: "transaction.created"
+  KAFKA_DLQ_TOPIC: "transaction.dlq"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger-collector.distributed-ledger.svc.cluster.local:4317"
+  
+  # Fraud engine tuning
+  FRAUD_WINDOW_DURATION_SEC: "60"
+  FRAUD_MAX_IN_WINDOW: "10"
+  FRAUD_BURST_WINDOW_SEC: "10"
+  FRAUD_MAX_BURST: "3"
+  FRAUD_CUMULATIVE_AMOUNT_THRESHOLD: "100000000"
+  FRAUD_HIGH_AMOUNT_THRESHOLD: "50000000"
+  
+  # Notification worker tuning
+  NOTIFICATION_CONCURRENCY: "10"
+  NOTIFICATION_MAX_RETRIES: "3"
+  NOTIFICATION_INITIAL_BACKOFF_MS: "500"
+  WEBHOOK_TARGET_URL: "http://webhook-mock-service.distributed-ledger.svc.cluster.local:8088/api/v1/webhook"

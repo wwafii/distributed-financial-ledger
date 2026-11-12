@@ -1,0 +1,36 @@
+# =============================================================================
+# Stage 1: Build binary using official Go Alpine builder
+# =============================================================================
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /workspace
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -o /bin/ledger \
+    ./services/ledger/cmd/main.go
+
+# =============================================================================
+# Stage 2: Ultra-minimal hardened Alpine runtime (~15MB, non-root user)
+# =============================================================================
+FROM alpine:3.20
+
+RUN apk --no-cache add ca-certificates tzdata && \
+    addgroup -S appgroup && adduser -S appuser -G appgroup
+
+USER appuser
+WORKDIR /app
+
+COPY --from=builder /bin/ledger /app/ledger
+
+EXPOSE 9101 9111
+
+ENTRYPOINT ["/app/ledger"]

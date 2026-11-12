@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-service
+  namespace: distributed-ledger
+  labels:
+    app.kubernetes.io/name: fraud-service
+    app.kubernetes.io/component: fraud-engine
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fraud-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fraud-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9102"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: fraud
+          image: distributed-ledger/fraud:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9102
+          envFrom:
+            - configMapRef:
+                name: ledger-config
+          env:
+            - name: METRICS_PORT
+              value: "9102"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9102
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2

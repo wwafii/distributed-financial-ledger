@@ -28,6 +28,16 @@ func (h *TracingHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.Handler.Handle(ctx, r)
 }
 
+// WithAttrs preserves TracingHandler wrapping when logger.With() is invoked
+func (h *TracingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &TracingHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+// WithGroup preserves TracingHandler wrapping when logger.WithGroup() is invoked
+func (h *TracingHandler) WithGroup(name string) slog.Handler {
+	return &TracingHandler{Handler: h.Handler.WithGroup(name)}
+}
+
 // New creates a production structured JSON logger with tracing capabilities
 func New(serviceName string, w io.Writer) *slog.Logger {
 	if w == nil {

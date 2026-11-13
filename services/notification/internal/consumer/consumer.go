@@ -18,6 +18,7 @@ import (
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/notification/internal/domain"
 	"github.com/wwafii/distributed-financial-ledger/services/notification/internal/sender"
+	otelcodes "go.opentelemetry.io/otel/codes"
 )
 
 // DefaultEqualJitter applies AWS Equal Jitter to eliminate thundering herd:
@@ -178,6 +179,9 @@ func (c *NotificationConsumer) ProcessMessage(ctx context.Context, msg kafka.Mes
 				"error", err,
 			)
 			c.cfg.SleepFn(backoff)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 		}
 	}
 
@@ -209,6 +213,8 @@ func (c *NotificationConsumer) ProcessMessage(ctx context.Context, msg kafka.Mes
 	if c.publisher != nil {
 		pubErr := c.publisher.Publish(ctx, c.cfg.DLQTopic, string(msg.Key), dlqBytes)
 		if pubErr != nil {
+			span.RecordError(pubErr)
+			span.SetStatus(otelcodes.Error, pubErr.Error())
 			c.logger.Error("failed to dispatch message to Kafka DLQ", "error", pubErr)
 			return fmt.Errorf("failed to publish to DLQ: %w", pubErr)
 		}
@@ -218,6 +224,7 @@ func (c *NotificationConsumer) ProcessMessage(ctx context.Context, msg kafka.Mes
 		)
 	}
 
+	span.SetStatus(otelcodes.Ok, "routed_to_dlq")
 	return nil
 }
 
@@ -232,12 +239,13 @@ func (c *NotificationConsumer) Start(ctx context.Context) {
 	sem := make(chan struct{}, c.cfg.WorkerPoolSize)
 	var wg sync.WaitGroup
 
+WorkerLoop:
 	for {
 		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				c.logger.Info("notification consumer stopped cleanly, draining workers...")
-				break
+				break WorkerLoop
 			}
 			c.logger.Error("error fetching kafka message in notification worker", "error", err)
 			time.Sleep(500 * time.Millisecond)
@@ -247,7 +255,7 @@ func (c *NotificationConsumer) Start(ctx context.Context) {
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			break
+			break WorkerLoop
 		}
 
 		wg.Add(1)
@@ -258,10 +266,12 @@ func (c *NotificationConsumer) Start(ctx context.Context) {
 			}()
 
 			if err := c.ProcessMessage(ctx, m); err != nil {
-				c.logger.Error("error processing notification message", "error", err)
+				// Zero Data Loss: If DLQ routing fails, DO NOT commit the offset so Kafka redelivers!
+				c.logger.Error("error processing notification message, skipping commit to prevent silent data loss", "error", err)
+				return
 			}
 
-			// Always commit message offset after delivery OR DLQ routing to prevent partition blocking
+			// Commit offset only after successful delivery or successful DLQ routing
 			if err := c.reader.CommitMessages(ctx, m); err != nil {
 				c.logger.Error("failed to commit kafka offset in notification worker", "error", err)
 			}

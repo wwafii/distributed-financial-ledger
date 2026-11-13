@@ -3,6 +3,8 @@ package telemetry
 import (
 	"context"
 	"log/slog"
+	"os"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -62,11 +64,18 @@ func InitTracer(ctx context.Context, serviceName string, otlpEndpoint string, lo
 		res = resource.Default()
 	}
 
-	// 4. Register BatchSpanProcessor
+	// 4. Register BatchSpanProcessor with configurable ratio-based sampler (anti-trace-flooding)
+	sampler := sdktrace.Sampler(sdktrace.AlwaysSample())
+	if ratioStr := os.Getenv("OTEL_SAMPLING_RATIO"); ratioStr != "" {
+		if ratio, err := strconv.ParseFloat(ratioStr, 64); err == nil && ratio >= 0 && ratio <= 1.0 {
+			sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
+		}
+	}
+
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(500*time.Millisecond)),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSampler(sampler),
 	)
 	otel.SetTracerProvider(tp)
 

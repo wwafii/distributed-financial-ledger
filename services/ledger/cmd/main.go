@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,7 +86,12 @@ func main() {
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
 	defer cancelRelay()
 
-	go relay.Start(relayCtx)
+	var relayWg sync.WaitGroup
+	relayWg.Add(1)
+	go func() {
+		defer relayWg.Done()
+		relay.Start(relayCtx)
+	}()
 	log.Info("outbox relay background worker started", "brokers", brokerList)
 
 	// 2. Initialize and Start gRPC Server
@@ -130,6 +136,7 @@ func main() {
 
 	log.Info("shutting down ledger service gracefully...")
 	cancelRelay()
+	relayWg.Wait()
 	grpcServer.GracefulStop()
 	log.Info("ledger service stopped cleanly")
 }

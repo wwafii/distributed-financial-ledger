@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS entries (
 
 CREATE INDEX IF NOT EXISTS idx_entries_transaction_id ON entries(transaction_id);
 CREATE INDEX IF NOT EXISTS idx_entries_account_id ON entries(account_id);
+CREATE INDEX IF NOT EXISTS idx_entries_account_created ON entries(account_id, created_at DESC);
 
 -- -----------------------------------------------------------------------------
 -- 4. Outbox Events Table (For Transactional Outbox Pattern to Kafka)
@@ -59,13 +60,14 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     aggregate_type VARCHAR(32) NOT NULL,
     aggregate_id VARCHAR(64) NOT NULL,
     payload JSONB NOT NULL,
-    status VARCHAR(16) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED')),
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'IN_FLIGHT', 'PUBLISHED', 'FAILED')),
     retry_count INT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     published_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_outbox_events_status_created ON outbox_events(status, created_at)
+CREATE INDEX IF NOT EXISTS idx_outbox_events_status_next_retry ON outbox_events(status, next_retry_at, created_at)
 WHERE status = 'PENDING';
 
 -- -----------------------------------------------------------------------------

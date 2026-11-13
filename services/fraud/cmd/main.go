@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -110,7 +111,7 @@ func main() {
 		GroupID:        kafkaGroupID,
 		MinBytes:       10e3, // 10KB
 		MaxBytes:       10e6, // 10MB
-		CommitInterval: 1 * time.Second,
+		CommitInterval: 0,    // Manual commits only via CommitMessages to prevent premature ack
 		StartOffset:    kafka.LastOffset,
 	})
 	defer reader.Close()
@@ -132,7 +133,12 @@ func main() {
 	eval := evaluator.NewVelocityEvaluator(rdb, fraudConfig)
 	fraudConsumer := consumer.NewFraudConsumer(reader, eval, ledgerClient, publisher, log)
 
-	go fraudConsumer.Start(ctx)
+	var consumerWg sync.WaitGroup
+	consumerWg.Add(1)
+	go func() {
+		defer consumerWg.Done()
+		fraudConsumer.Start(ctx)
+	}()
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
@@ -141,6 +147,7 @@ func main() {
 
 	log.Info("shutting down fraud service gracefully...")
 	cancel()
+	consumerWg.Wait()
 	_ = reader.Close()
 	log.Info("fraud service stopped cleanly")
 }

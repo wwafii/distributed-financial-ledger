@@ -48,13 +48,13 @@ export default function () {
 
   const res = http.post(`${BASE_URL}/api/v1/transactions`, payload, { headers });
 
-  const isFirstSuccess = res.status === 200 && res.headers['X-Idempotent-Replay'] === undefined;
-  const isReplay = res.status === 200 && res.headers['X-Idempotent-Replay'] === 'true';
+  const isFirstSuccess = (res.status === 201 || res.status === 200) && res.headers['X-Idempotent-Replay'] === undefined;
+  const isReplay = (res.status === 201 || res.status === 200) && res.headers['X-Idempotent-Replay'] === 'true';
   const isConflict = res.status === 409;
 
   check(res, {
-    'status is 200 (Success/Replay) or 409 (In-flight Conflict)': (r) =>
-      r.status === 200 || r.status === 409,
+    'status is 201/200 (Success/Replay) or 409 (In-flight Conflict)': (r) =>
+      r.status === 201 || r.status === 200 || r.status === 409,
   });
 
   if (isFirstSuccess) {

@@ -87,7 +87,20 @@ func NewVelocityEvaluator(rdb *redis.Client, cfg VelocityConfig) *VelocityEvalua
 // Evaluate performs sub-5ms multi-tier sliding-window fraud checks using Redis Sorted Sets (ZSET)
 func (e *VelocityEvaluator) Evaluate(ctx context.Context, evt *domain.TransactionCreatedEvent) (*domain.FraudCheckResult, error) {
 	key := fmt.Sprintf("fraud:velocity:%s", evt.SourceAccount)
-	now := time.Now().UnixMilli()
+
+	// Stream Correctness: Prioritize Event Time over Processing Time to prevent false-positive
+	// bot flags when consumer lag occurs or when pods restart.
+	var eventMillis int64
+	if evt.Timestamp != "" {
+		if t, err := time.Parse(time.RFC3339, evt.Timestamp); err == nil {
+			eventMillis = t.UnixMilli()
+		}
+	}
+	if eventMillis <= 0 {
+		eventMillis = time.Now().UnixMilli()
+	}
+	now := eventMillis
+
 	windowStart := now - e.cfg.WindowDuration.Milliseconds()
 	burstStart := now - e.cfg.BurstWindowDuration.Milliseconds()
 

@@ -102,8 +102,15 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start).Seconds()
 		statusStr := strconv.Itoa(interceptor.statusCode)
 
-		HTTPRequestsTotal.WithLabelValues(r.Method, r.URL.Path, statusStr).Inc()
-		HTTPRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration)
+		// Guard against High Cardinality Metric Bomb: Use route pattern (e.g. /api/v1/accounts/{account_number}/balance)
+		// rather than dynamic raw URL path containing specific account numbers.
+		pathPattern := r.Pattern
+		if pathPattern == "" {
+			pathPattern = r.URL.Path
+		}
+
+		HTTPRequestsTotal.WithLabelValues(r.Method, pathPattern, statusStr).Inc()
+		HTTPRequestDuration.WithLabelValues(r.Method, pathPattern).Observe(duration)
 	})
 }
 

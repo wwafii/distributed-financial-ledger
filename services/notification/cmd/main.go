@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -80,14 +81,19 @@ func main() {
 		GroupID:        kafkaGroupID,
 		MinBytes:       10e3, // 10KB
 		MaxBytes:       10e6, // 10MB
-		CommitInterval: 1 * time.Second,
+		CommitInterval: 0,    // Manual commits only via CommitMessages to prevent premature ack
 		StartOffset:    kafka.LastOffset,
 	})
 	defer reader.Close()
 
 	// 4. Start Notification Consumer
 	notifConsumer := consumer.NewNotificationConsumer(reader, webhookSender, publisher, log, cfg)
-	go notifConsumer.Start(ctx)
+	var consumerWg sync.WaitGroup
+	consumerWg.Add(1)
+	go func() {
+		defer consumerWg.Done()
+		notifConsumer.Start(ctx)
+	}()
 
 	log.Info("notification worker initialized successfully",
 		"topic", kafkaTopic,
@@ -104,6 +110,7 @@ func main() {
 
 	log.Info("shutting down notification worker gracefully...")
 	cancel()
+	consumerWg.Wait()
 	_ = reader.Close()
 	log.Info("notification worker stopped cleanly")
 }

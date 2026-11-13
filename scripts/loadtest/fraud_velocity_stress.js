@@ -46,7 +46,7 @@ export default function () {
 
   check(res, {
     'request executed or intercepted by fraud rule': (r) =>
-      r.status === 200 || r.status === 403 || r.status === 422,
+      r.status === 200 || r.status === 201 || r.status === 403 || r.status === 422,
   });
 
   sleep(0.1);

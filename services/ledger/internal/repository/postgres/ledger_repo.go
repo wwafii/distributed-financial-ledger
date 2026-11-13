@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -51,27 +52,38 @@ func (r *LedgerRepository) GetAccountByNumber(ctx context.Context, accNum string
 	return &acc, nil
 }
 
-// FreezeAccount updates account status to FROZEN
+// FreezeAccount updates account status to FROZEN idempotently
 func (r *LedgerRepository) FreezeAccount(ctx context.Context, accNum, reason string) error {
+	var currentStatus string
+	err := r.pool.QueryRow(ctx, `SELECT status FROM accounts WHERE account_number = $1`, accNum).Scan(&currentStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errs.New(errs.CodeNotFound, fmt.Sprintf("account %s not found", accNum))
+		}
+		return errs.Wrap(errs.CodeInternal, "failed to query account status", err)
+	}
+
+	if currentStatus == string(domain.AccountStatusFrozen) {
+		// Idempotent: already frozen, return success cleanly
+		return nil
+	}
+
 	query := `
 		UPDATE accounts 
 		SET status = 'FROZEN', updated_at = NOW()
 		WHERE account_number = $1 AND status != 'FROZEN'
 	`
-	tag, err := r.pool.Exec(ctx, query, accNum)
+	_, err = r.pool.Exec(ctx, query, accNum)
 	if err != nil {
 		return errs.Wrap(errs.CodeInternal, "failed to freeze account", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return errs.New(errs.CodeNotFound, fmt.Sprintf("account %s not found or already frozen", accNum))
 	}
 	return nil
 }
 
 // ExecuteTransfer performs atomic double-entry transfer with row-level locking
 func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.TransferCommand) (*domain.Transaction, error) {
-	if cmd.Amount <= 0 {
-		return nil, errs.New(errs.CodeInvalidInput, "transfer amount must be strictly greater than zero")
+	if math.IsNaN(cmd.Amount) || math.IsInf(cmd.Amount, 0) || cmd.Amount <= 0 {
+		return nil, errs.New(errs.CodeInvalidInput, "transfer amount must be a valid strictly positive number")
 	}
 	if cmd.SourceAccount == cmd.DestinationAcc {
 		return nil, errs.New(errs.CodeInvalidInput, "cannot transfer to the same account")
@@ -139,6 +151,12 @@ func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.Tran
 	destAcc := accountsMap[cmd.DestinationAcc]
 
 	// 3. Domain Validations
+	if sourceAcc.Currency != destAcc.Currency {
+		return nil, errs.New(errs.CodeInvalidInput, fmt.Sprintf("currency mismatch: %s to %s requires FX conversion", sourceAcc.Currency, destAcc.Currency))
+	}
+	if cmd.Currency != "" && cmd.Currency != sourceAcc.Currency {
+		return nil, errs.New(errs.CodeInvalidInput, fmt.Sprintf("command currency %s must match account currency %s", cmd.Currency, sourceAcc.Currency))
+	}
 	if sourceAcc.Status != domain.AccountStatusActive {
 		return nil, errs.New(errs.CodeAccountFrozen, fmt.Sprintf("source account %s is %s", sourceAcc.AccountNumber, sourceAcc.Status))
 	}
@@ -174,15 +192,15 @@ func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.Tran
 		return nil, errs.Wrap(errs.CodeInternal, "failed to record transaction header", err)
 	}
 
-	// 6. Insert Double-Entry Items:
-	// Entry 1: CREDIT on Source (Money leaving source)
-	// Entry 2: DEBIT on Destination (Money arriving at destination)
-	// Invariant: SUM(DEBIT) = SUM(CREDIT) = cmd.Amount
+	// 6. Insert Double-Entry Items (Standard Banking Liability Ledger Perspective):
+	// Bank liability to Source account decreases -> DEBIT
+	// Bank liability to Destination account increases -> CREDIT
+	// Strict Invariant: SUM(DEBIT) = SUM(CREDIT) = cmd.Amount
 	_, err = tx.Exec(ctx, `
 		INSERT INTO entries (id, transaction_id, account_id, direction, amount, created_at)
 		VALUES 
-			($1, $2, $3, 'CREDIT', $4, $5),
-			($6, $2, $7, 'DEBIT', $4, $5)
+			($1, $2, $3, 'DEBIT', $4, $5),
+			($6, $2, $7, 'CREDIT', $4, $5)
 	`, uuid.New(), transactionID, sourceAcc.ID, cmd.Amount, createdAt,
 		uuid.New(), destAcc.ID)
 	if err != nil {
@@ -190,6 +208,7 @@ func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.Tran
 	}
 
 	// 7. Insert Transactional Outbox Event (Atomic with the financial transfer!)
+	// Crucial: aggregate_id is set to sourceAcc.AccountNumber so Kafka partitions by account key!
 	eventPayload := map[string]interface{}{
 		"transaction_id":      transactionID.String(),
 		"reference_id":        cmd.ReferenceID,
@@ -207,9 +226,9 @@ func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.Tran
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox_events (id, event_type, aggregate_type, aggregate_id, payload, status, created_at)
-		VALUES ($1, 'transaction.created', 'TRANSACTION', $2, $3, 'PENDING', $4)
-	`, uuid.New(), transactionID.String(), payloadBytes, createdAt)
+		INSERT INTO outbox_events (id, event_type, aggregate_type, aggregate_id, payload, status, created_at, next_retry_at)
+		VALUES ($1, 'transaction.created', 'TRANSACTION', $2, $3, 'PENDING', $4, $4)
+	`, uuid.New(), sourceAcc.AccountNumber, payloadBytes, createdAt)
 	if err != nil {
 		return nil, errs.Wrap(errs.CodeInternal, "failed to record outbox event", err)
 	}

@@ -1,15 +1,21 @@
 package http
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"time"
 
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/gateway/internal/idempotency"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -60,8 +66,8 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 	defer span.End()
 
 	idempKey := r.Header.Get("Idempotency-Key")
-
 	if idempKey == "" {
+		span.SetStatus(otelcodes.Error, "missing idempotency key")
 		writeJSON(w, http.StatusBadRequest, StandardResponse{
 			Success: false,
 			Error:   "Missing required 'Idempotency-Key' header",
@@ -69,9 +75,75 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// 1. Check or Acquire Idempotency Lock via Redis
-	lockResult, err := h.idempEngine.AcquireOrGet(ctx, idempKey, 60*time.Second)
+	// 1. Bound request body size (Max 1MB) to protect against DoS OOM
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "failed to read body")
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Failed to read request body or payload exceeds maximum allowed size (1MB)",
+		})
+		return
+	}
+
+	// 2. Parse and execute basic input validation at ingress boundary
+	var reqBody CreateTransactionHTTPRequest
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "invalid JSON")
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Invalid JSON payload: " + err.Error(),
+		})
+		return
+	}
+
+	if reqBody.SourceAccount == "" || reqBody.DestinationAcc == "" {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "source_account and destination_account are required",
+		})
+		return
+	}
+	if reqBody.SourceAccount == reqBody.DestinationAcc {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "cannot transfer to the same account",
+		})
+		return
+	}
+	if math.IsNaN(reqBody.Amount) || math.IsInf(reqBody.Amount, 0) || reqBody.Amount <= 0 {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "transfer amount must be a valid strictly positive number",
+		})
+		return
+	}
+
+	if reqBody.Currency == "" {
+		reqBody.Currency = "IDR"
+	}
+
+	// 3. Compute SHA-256 payload fingerprint (Stripe Idempotency Standard)
+	hash := sha256.Sum256(bodyBytes)
+	payloadHash := hex.EncodeToString(hash[:])
+
+	// 4. Check or Acquire Idempotency Lock via Redis with payload fingerprinting
+	lockResult, err := h.idempEngine.AcquireWithPayload(ctx, idempKey, payloadHash, 60*time.Second)
+	if err != nil {
+		if errors.Is(err, idempotency.ErrPayloadMismatch) {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "payload mismatch on idempotency key")
+			writeJSON(w, http.StatusBadRequest, StandardResponse{
+				Success: false,
+				Error:   "Idempotency-Key reused with different request payload",
+			})
+			return
+		}
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "idempotency evaluation failure")
 		h.logger.Error("idempotency check failure", "error", err)
 		writeJSON(w, http.StatusInternalServerError, StandardResponse{
 			Success: false,
@@ -80,7 +152,7 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// 2. Handle Replay if key was already seen
+	// 5. Handle Replay if key was already seen
 	if !lockResult.Acquired {
 		record := lockResult.Record
 		if record.Status == idempotency.StatusProcessing {
@@ -100,46 +172,35 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 			_, _ = w.Write(record.Body)
 			return
 		}
-	}
 
-	// 3. First time execution: Process Transfer Request
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		_ = h.idempEngine.Release(ctx, idempKey)
-		writeJSON(w, http.StatusBadRequest, StandardResponse{
+		// Defensive check: Corrupted or unrecognized lock record
+		span.SetStatus(otelcodes.Error, "corrupted idempotency state")
+		writeJSON(w, http.StatusInternalServerError, StandardResponse{
 			Success: false,
-			Error:   "Failed to read request body",
+			Error:   "Invalid or corrupted idempotency record state",
 		})
 		return
 	}
 
-	var reqBody CreateTransactionHTTPRequest
-	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
-		_ = h.idempEngine.Release(ctx, idempKey)
-		writeJSON(w, http.StatusBadRequest, StandardResponse{
-			Success: false,
-			Error:   "Invalid JSON payload: " + err.Error(),
-		})
-		return
-	}
-
-	if reqBody.Currency == "" {
-		reqBody.Currency = "IDR"
-	}
-
-	// 4. Call Core Ledger Service via gRPC
+	// 6. First time execution: Call Core Ledger Service via gRPC
 	grpcReq := &ledgerv1.CreateTransactionRequest{
-		ReferenceId:                idempKey,
-		SourceAccountNumber:        reqBody.SourceAccount,
-		DestinationAccountNumber:   reqBody.DestinationAcc,
-		Amount:                     reqBody.Amount,
-		Currency:                   reqBody.Currency,
-		Description:                reqBody.Description,
+		ReferenceId:              idempKey,
+		SourceAccountNumber:      reqBody.SourceAccount,
+		DestinationAccountNumber: reqBody.DestinationAcc,
+		Amount:                   reqBody.Amount,
+		Currency:                 reqBody.Currency,
+		Description:              reqBody.Description,
 	}
 
 	grpcResp, err := h.ledgerClient.CreateTransaction(telemetry.InjectGRPC(ctx), grpcReq)
 	if err != nil {
-		_ = h.idempEngine.Release(ctx, idempKey)
+		// Use uncancelled context with dedicated timeout so lock cleanup succeeds even if client disconnected
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		_ = h.idempEngine.Release(cleanupCtx, idempKey)
+		cancel()
+
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		grpcStatus, _ := status.FromError(err)
 
 		var httpCode int
@@ -162,6 +223,8 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		})
 		return
 	}
+
+	span.SetStatus(otelcodes.Ok, "success")
 
 	// 5. Success: Cache final response in Redis for future replays
 	respPayload := StandardResponse{

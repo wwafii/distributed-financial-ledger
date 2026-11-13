@@ -22,9 +22,10 @@ type KafkaPublisher struct {
 func NewKafkaPublisher(brokers []string) *KafkaPublisher {
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
-		Balancer:     &kafka.LeastBytes{},
+		Balancer:     &kafka.Murmur2Balancer{}, // Guarantees strict partition ordering by account key
 		BatchTimeout: 10 * time.Millisecond,
-		Async:        false, // Synchronous dispatch for reliability
+		Async:        false,                   // Synchronous dispatch for reliability
+		RequiredAcks: kafka.RequireAll,        // Zero-loss financial durability: wait for all ISR replicas
 	}
 	return &KafkaPublisher{writer: writer}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	pkgkafka "github.com/wwafii/distributed-financial-ledger/pkg/kafka"
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
+	otelcodes "go.opentelemetry.io/otel/codes"
 )
 
 // OutboxRelayConfig holds configuration for polling relay
@@ -68,11 +69,11 @@ func (r *OutboxRelay) ProcessBatch(ctx context.Context) (int, error) {
 	}
 	defer tx.Rollback(ctx)
 
-	// Fetch and lock unclaimed pending records (concurrency-safe across multiple instances)
+	// Fetch and lock unclaimed pending records whose backoff has elapsed (concurrency-safe via SKIP LOCKED)
 	query := `
 		SELECT id, event_type, aggregate_id, payload, retry_count
 		FROM outbox_events
-		WHERE status = 'PENDING'
+		WHERE status = 'PENDING' AND next_retry_at <= NOW()
 		ORDER BY created_at ASC
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
@@ -120,11 +121,16 @@ func (r *OutboxRelay) ProcessBatch(ctx context.Context) (int, error) {
 		tracer := telemetry.Tracer("outbox-relay")
 		publishCtx, span := tracer.Start(publishCtx, "Outbox Relay Publish: "+item.EventType)
 
-		// Publish event to Kafka
-		publishErr := r.publisher.Publish(publishCtx, item.EventType, item.AggregateID, item.Payload)
-		span.End()
+		// Publish event to Kafka with bounded network timeout to prevent DB pool starvation
+		pubTimeoutCtx, pubCancel := context.WithTimeout(publishCtx, 3*time.Second)
+		publishErr := r.publisher.Publish(pubTimeoutCtx, item.EventType, item.AggregateID, item.Payload)
+		pubCancel()
 
 		if publishErr != nil {
+			span.RecordError(publishErr)
+			span.SetStatus(otelcodes.Error, publishErr.Error())
+			span.End()
+
 			r.logger.Error("failed to publish outbox event",
 				"event_id", item.ID,
 				"event_type", item.EventType,
@@ -134,6 +140,7 @@ func (r *OutboxRelay) ProcessBatch(ctx context.Context) (int, error) {
 
 			newRetry := item.RetryCount + 1
 			newStatus := "PENDING"
+			backoffSec := 1 << newRetry // Exponential backoff: 2s, 4s, 8s, 16s...
 			if newRetry >= r.cfg.MaxRetries {
 				newStatus = "FAILED"
 				r.logger.Warn("outbox event marked as FAILED after max retries", "event_id", item.ID)
@@ -141,11 +148,14 @@ func (r *OutboxRelay) ProcessBatch(ctx context.Context) (int, error) {
 
 			_, _ = tx.Exec(ctx, `
 				UPDATE outbox_events 
-				SET status = $1, retry_count = $2 
+				SET status = $1, retry_count = $2, next_retry_at = NOW() + make_interval(secs => $4)
 				WHERE id = $3
-			`, newStatus, newRetry, item.ID)
+			`, newStatus, newRetry, item.ID, float64(backoffSec))
 			continue
 		}
+
+		span.SetStatus(otelcodes.Ok, "published")
+		span.End()
 
 		// Mark as PUBLISHED with published_at timestamp
 		_, err := tx.Exec(ctx, `

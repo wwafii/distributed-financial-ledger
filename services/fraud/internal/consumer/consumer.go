@@ -14,6 +14,7 @@ import (
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/fraud/internal/domain"
 	"github.com/wwafii/distributed-financial-ledger/services/fraud/internal/evaluator"
+	otelcodes "go.opentelemetry.io/otel/codes"
 )
 
 type FraudConsumer struct {
@@ -81,8 +82,11 @@ func (c *FraudConsumer) ProcessMessage(ctx context.Context, msg kafka.Message) e
 			Reason:        result.Reason,
 		})
 		if freezeErr != nil {
+			span.RecordError(freezeErr)
+			span.SetStatus(otelcodes.Error, freezeErr.Error())
 			c.logger.Error("failed to freeze account via gRPC", "account", result.AccountNumber, "error", freezeErr)
 		} else {
+			span.SetStatus(otelcodes.Ok, "account_frozen")
 			c.logger.Info("account frozen successfully via gRPC",
 				"account", freezeResp.AccountNumber,
 				"status", freezeResp.Status,

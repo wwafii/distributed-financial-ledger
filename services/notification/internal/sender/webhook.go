@@ -52,14 +52,21 @@ type HTTPWebhookSender struct {
 	client *http.Client
 }
 
-// NewHTTPWebhookSender creates a new HTTPWebhookSender with a bounded timeout
+// NewHTTPWebhookSender creates a new HTTPWebhookSender with bounded timeout and tuned connection pool
 func NewHTTPWebhookSender(timeout time.Duration) *HTTPWebhookSender {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	// Production-grade Transport: Prevents socket churn and TIME_WAIT exhaustion under load
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &HTTPWebhookSender{
 		client: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 	}
 }

@@ -22,8 +22,18 @@ spec:
         prometheus.io/port: "9103"
         prometheus.io/path: "/metrics"
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
       containers:
         - name: notification
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           image: distributed-ledger/notification:latest
           imagePullPolicy: IfNotPresent
           ports:

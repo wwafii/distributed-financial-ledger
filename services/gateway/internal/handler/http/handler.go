@@ -6,13 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
 	"time"
 
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
+	"github.com/wwafii/distributed-financial-ledger/pkg/auth"
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/gateway/internal/idempotency"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -24,18 +27,32 @@ type GatewayHandler struct {
 	ledgerClient ledgerv1.LedgerServiceClient
 	idempEngine  *idempotency.Engine
 	logger       *slog.Logger
+	jwtSecret    []byte
 }
 
 func NewGatewayHandler(
 	ledgerClient ledgerv1.LedgerServiceClient,
 	idempEngine *idempotency.Engine,
 	logger *slog.Logger,
+	jwtSecret ...[]byte,
 ) *GatewayHandler {
+	secret := []byte(os.Getenv("JWT_SECRET"))
+	if len(secret) == 0 {
+		secret = []byte("default-financial-ledger-jwt-secret-key-32b")
+	}
+	if len(jwtSecret) > 0 && len(jwtSecret[0]) > 0 {
+		secret = jwtSecret[0]
+	}
 	return &GatewayHandler{
 		ledgerClient: ledgerClient,
 		idempEngine:  idempEngine,
 		logger:       logger,
+		jwtSecret:    secret,
 	}
+}
+
+func (h *GatewayHandler) JWTSecret() []byte {
+	return h.jwtSecret
 }
 
 type CreateTransactionHTTPRequest struct {
@@ -124,6 +141,19 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 
 	if reqBody.Currency == "" {
 		reqBody.Currency = "IDR"
+	}
+
+	// 2.1 BOLA / IDOR Defense: Verify Account Ownership if authenticated
+	claims := auth.FromContext(r.Context())
+	if claims != nil {
+		if claims.Role != auth.RoleAdmin && claims.Role != auth.RoleService && claims.AccountNumber != reqBody.SourceAccount {
+			span.SetStatus(otelcodes.Error, "unauthorized account access (IDOR blocked)")
+			writeJSON(w, http.StatusForbidden, StandardResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Forbidden: unauthorized to initiate transactions from source_account '%s'", reqBody.SourceAccount),
+			})
+			return
+		}
 	}
 
 	// 3. Compute SHA-256 payload fingerprint (Stripe Idempotency Standard)
@@ -259,6 +289,19 @@ func (h *GatewayHandler) HandleGetBalance(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// BOLA / IDOR Defense: Verify Account Ownership if authenticated
+	claims := auth.FromContext(r.Context())
+	if claims != nil {
+		if claims.Role != auth.RoleAdmin && claims.Role != auth.RoleService && claims.AccountNumber != accNum {
+			span.SetStatus(otelcodes.Error, "unauthorized balance access (IDOR blocked)")
+			writeJSON(w, http.StatusForbidden, StandardResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Forbidden: unauthorized to view balance for account '%s'", accNum),
+			})
+			return
+		}
+	}
+
 	grpcResp, err := h.ledgerClient.GetAccountBalance(telemetry.InjectGRPC(ctx), &ledgerv1.GetAccountBalanceRequest{
 		AccountNumber: accNum,
 	})
@@ -298,6 +341,19 @@ func (h *GatewayHandler) HandleFreezeAccount(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// BFLA Defense: Enforce Administrator Privileges
+	claims := auth.FromContext(r.Context())
+	if claims != nil {
+		if claims.Role != auth.RoleAdmin && claims.Role != auth.RoleService {
+			span.SetStatus(otelcodes.Error, "unauthorized admin operation (BFLA blocked)")
+			writeJSON(w, http.StatusForbidden, StandardResponse{
+				Success: false,
+				Error:   "Forbidden: administrator privileges required to freeze accounts",
+			})
+			return
+		}
+	}
+
 	grpcResp, err := h.ledgerClient.FreezeAccount(telemetry.InjectGRPC(ctx), &ledgerv1.FreezeAccountRequest{
 		AccountNumber: accNum,
 		Reason:        "Manual freeze from gateway",
@@ -311,6 +367,79 @@ func (h *GatewayHandler) HandleFreezeAccount(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, StandardResponse{
 		Success: true,
 		Data:    grpcResp,
+	})
+}
+
+type IssueTokenHTTPRequest struct {
+	AccountNumber string `json:"account_number"`
+	Role          string `json:"role,omitempty"` // "customer", "admin"
+	Secret        string `json:"secret,omitempty"`
+}
+
+// HandleIssueToken issues a signed JWT token for authentication
+func (h *GatewayHandler) HandleIssueToken(w http.ResponseWriter, r *http.Request) {
+	var req IssueTokenHTTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Invalid JSON payload: " + err.Error(),
+		})
+		return
+	}
+
+	if req.AccountNumber == "" {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "account_number is required",
+		})
+		return
+	}
+
+	if req.Role == "" {
+		req.Role = auth.RoleCustomer
+	}
+
+	// If requesting admin role, enforce admin secret
+	if req.Role == auth.RoleAdmin {
+		expectedAdminSecret := os.Getenv("ADMIN_SECRET")
+		if expectedAdminSecret == "" {
+			expectedAdminSecret = "admin-secret-dev-key"
+		}
+		if req.Secret != expectedAdminSecret {
+			writeJSON(w, http.StatusUnauthorized, StandardResponse{
+				Success: false,
+				Error:   "Unauthorized: invalid admin secret",
+			})
+			return
+		}
+	}
+
+	exp := time.Now().Add(24 * time.Hour).Unix()
+	claims := auth.Claims{
+		Subject:       req.AccountNumber,
+		AccountNumber: req.AccountNumber,
+		Role:          req.Role,
+		IssuedAt:      time.Now().Unix(),
+		ExpiresAt:     exp,
+	}
+
+	token, err := auth.SignToken(claims, h.jwtSecret)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, StandardResponse{
+			Success: false,
+			Error:   "Failed to sign auth token: " + err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, StandardResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"token":          token,
+			"account_number": req.AccountNumber,
+			"role":           req.Role,
+			"expires_at":     exp,
+		},
 	})
 }
 

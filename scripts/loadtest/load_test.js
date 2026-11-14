@@ -47,6 +47,21 @@ const ACCOUNTS = [
   'ACC-CHARLIE-03',
 ];
 
+export function setup() {
+  const tokens = {};
+  for (const acc of ACCOUNTS) {
+    const res = http.post(`${BASE_URL}/api/v1/auth/token`, JSON.stringify({ account_number: acc }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (res.status === 200) {
+      try {
+        tokens[acc] = res.json().data.token;
+      } catch (e) {}
+    }
+  }
+  return { tokens };
+}
+
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
     const r = (Math.random() * 16) | 0;
@@ -55,7 +70,7 @@ function generateUUID() {
   });
 }
 
-export default function () {
+export default function (data) {
   // Pick random distinct source and destination
   const srcIdx = Math.floor(Math.random() * ACCOUNTS.length);
   let destIdx = Math.floor(Math.random() * ACCOUNTS.length);
@@ -80,6 +95,9 @@ export default function () {
     'Content-Type': 'application/json',
     'Idempotency-Key': idempotencyKey,
   };
+  if (data && data.tokens && data.tokens[sourceAccount]) {
+    headers['Authorization'] = `Bearer ${data.tokens[sourceAccount]}`;
+  }
 
   const start = Date.now();
   const res = http.post(`${BASE_URL}/api/v1/transactions`, payload, { headers });

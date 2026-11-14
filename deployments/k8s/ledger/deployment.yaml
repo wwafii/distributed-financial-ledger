@@ -22,8 +22,18 @@ spec:
         prometheus.io/port: "9111"
         prometheus.io/path: "/metrics"
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
       containers:
         - name: ledger
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           image: distributed-ledger/ledger:latest
           imagePullPolicy: IfNotPresent
           ports:

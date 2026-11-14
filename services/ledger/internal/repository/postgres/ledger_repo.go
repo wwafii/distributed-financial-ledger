@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wwafii/distributed-financial-ledger/pkg/errs"
+	"github.com/wwafii/distributed-financial-ledger/pkg/money"
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/ledger/internal/domain"
 )
@@ -163,13 +164,19 @@ func (r *LedgerRepository) ExecuteTransfer(ctx context.Context, cmd *domain.Tran
 	if destAcc.Status != domain.AccountStatusActive {
 		return nil, errs.New(errs.CodeAccountFrozen, fmt.Sprintf("destination account %s is %s", destAcc.AccountNumber, destAcc.Status))
 	}
-	if sourceAcc.Balance < cmd.Amount {
-		return nil, errs.New(errs.CodeInsufficient, fmt.Sprintf("insufficient balance in account %s (balance: %.2f, required: %.2f)", sourceAcc.AccountNumber, sourceAcc.Balance, cmd.Amount))
+	// 4. Update balances using exact fixed-point arithmetic (zero IEEE-754 drift)
+	newSourceBal, err := money.Sub(sourceAcc.Balance, cmd.Amount)
+	if err != nil {
+		if errors.Is(err, money.ErrInsufficient) {
+			return nil, errs.New(errs.CodeInsufficient, fmt.Sprintf("insufficient balance in account %s (balance: %.4f, required: %.4f)", sourceAcc.AccountNumber, sourceAcc.Balance, cmd.Amount))
+		}
+		return nil, errs.New(errs.CodeInvalidInput, err.Error())
 	}
 
-	// 4. Update balances
-	newSourceBal := sourceAcc.Balance - cmd.Amount
-	newDestBal := destAcc.Balance + cmd.Amount
+	newDestBal, err := money.Add(destAcc.Balance, cmd.Amount)
+	if err != nil {
+		return nil, errs.New(errs.CodeInvalidInput, err.Error())
+	}
 
 	_, err = tx.Exec(ctx, `UPDATE accounts SET balance = $1, updated_at = NOW() WHERE id = $2`, newSourceBal, sourceAcc.ID)
 	if err != nil {

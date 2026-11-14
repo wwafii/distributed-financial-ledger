@@ -19,6 +19,18 @@ export const options = {
 
 const BASE_URL = __ENV.GATEWAY_URL || 'http://localhost:8000';
 
+export function setup() {
+  const res = http.post(`${BASE_URL}/api/v1/auth/token`, JSON.stringify({ account_number: 'ACC-ALICE-01' }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (res.status === 200) {
+    try {
+      return { token: res.json().data.token };
+    } catch (e) {}
+  }
+  return { token: '' };
+}
+
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
     const r = (Math.random() * 16) | 0;
@@ -27,7 +39,7 @@ function generateUUID() {
   });
 }
 
-export default function () {
+export default function (data) {
   // All requests hit Alice's account rapidly
   const payload = JSON.stringify({
     source_account: 'ACC-ALICE-01',
@@ -41,6 +53,9 @@ export default function () {
     'Content-Type': 'application/json',
     'Idempotency-Key': generateUUID(),
   };
+  if (data && data.token) {
+    headers['Authorization'] = `Bearer ${data.token}`;
+  }
 
   const res = http.post(`${BASE_URL}/api/v1/transactions`, payload, { headers });
 

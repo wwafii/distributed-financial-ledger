@@ -9,6 +9,7 @@ resources:
   - shared/configmap.yaml
   - shared/secrets.yaml
   - shared/ingress.yaml
+  - shared/networkpolicy.yaml
 
   # 2. API Gateway
   - gateway/deployment.yaml

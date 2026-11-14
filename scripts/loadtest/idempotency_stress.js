@@ -32,7 +32,26 @@ const BASE_URL = __ENV.GATEWAY_URL || 'http://localhost:8000';
 // Fixed idempotency key for this test run
 const FIXED_KEY = __ENV.FIXED_KEY || `idemp-stress-${Date.now()}`;
 
-export default function () {
+export function setup() {
+  const payload = JSON.stringify({
+    account_number: 'ACC-ALICE-01',
+    role: 'customer',
+  });
+  const res = http.post(`${BASE_URL}/api/v1/auth/token`, payload, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (res.status === 200) {
+    try {
+      const body = res.json();
+      return { token: body.data.token };
+    } catch (e) {
+      return { token: '' };
+    }
+  }
+  return { token: '' };
+}
+
+export default function (data) {
   const payload = JSON.stringify({
     source_account: 'ACC-ALICE-01',
     destination_account: 'ACC-BOB-02',
@@ -45,6 +64,9 @@ export default function () {
     'Content-Type': 'application/json',
     'Idempotency-Key': FIXED_KEY,
   };
+  if (data && data.token) {
+    headers['Authorization'] = `Bearer ${data.token}`;
+  }
 
   const res = http.post(`${BASE_URL}/api/v1/transactions`, payload, { headers });
 

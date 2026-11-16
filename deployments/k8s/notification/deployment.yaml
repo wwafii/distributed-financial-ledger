@@ -42,6 +42,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: ledger-config
+            - secretRef:
+                name: ledger-secrets
           env:
             - name: METRICS_PORT
               value: "9103"

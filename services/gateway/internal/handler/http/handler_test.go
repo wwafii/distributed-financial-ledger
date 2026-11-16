@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -180,6 +181,42 @@ func TestGatewayHandler_Security_TokenIssuance(t *testing.T) {
 	if claims.AccountNumber != "ACC-ALICE-01" {
 		t.Errorf("expected claims account ACC-ALICE-01, got: %s", claims.AccountNumber)
 	}
+
+	// 2. Unauthenticated attempt to request "service" role -> MUST BE 401 UNAUTHORIZED
+	reqServiceNoSecret := httptest.NewRequest("POST", "/api/v1/auth/token", bytes.NewReader([]byte(`{
+		"account_number": "ACC-ATTACKER",
+		"role": "service"
+	}`)))
+	recServiceNoSecret := httptest.NewRecorder()
+	handler.HandleIssueToken(recServiceNoSecret, reqServiceNoSecret)
+	if recServiceNoSecret.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for service role without secret, got: %d", recServiceNoSecret.Code)
+	}
+
+	// 3. Authenticated request for "service" role with valid secret -> MUST SUCCEED (200 OK)
+	os.Setenv("ADMIN_SECRET", "test-admin-secret-xyz")
+	defer os.Unsetenv("ADMIN_SECRET")
+	reqServiceWithSecret := httptest.NewRequest("POST", "/api/v1/auth/token", bytes.NewReader([]byte(`{
+		"account_number": "ACC-FRAUD-SERVICE",
+		"role": "service",
+		"secret": "test-admin-secret-xyz"
+	}`)))
+	recServiceWithSecret := httptest.NewRecorder()
+	handler.HandleIssueToken(recServiceWithSecret, reqServiceWithSecret)
+	if recServiceWithSecret.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for service role with valid secret, got: %d", recServiceWithSecret.Code)
+	}
+
+	// 4. Request with invalid/unknown role -> MUST BE 400 BAD REQUEST
+	reqBadRole := httptest.NewRequest("POST", "/api/v1/auth/token", bytes.NewReader([]byte(`{
+		"account_number": "ACC-ALICE-01",
+		"role": "superadmin"
+	}`)))
+	recBadRole := httptest.NewRecorder()
+	handler.HandleIssueToken(recBadRole, reqBadRole)
+	if recBadRole.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for unknown role, got: %d", recBadRole.Code)
+	}
 }
 
 func TestGatewayHandler_Security_IDOR_Protection(t *testing.T) {
@@ -301,5 +338,152 @@ func TestGatewayHandler_Security_BFLA_FreezeProtection(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("admin freeze expected 200 OK, got: %d", resp2.StatusCode)
+	}
+
+	// 3. Direct handler call without any claims (claims == nil fail-closed defense) -> MUST BE 403 FORBIDDEN
+	recDirect := httptest.NewRecorder()
+	reqDirect := httptest.NewRequest("POST", "/api/v1/accounts/ACC-BOB-02/freeze", nil)
+	reqDirect.SetPathValue("account_number", "ACC-BOB-02")
+	handler.HandleFreezeAccount(recDirect, reqDirect)
+	if recDirect.Code != http.StatusForbidden {
+		t.Errorf("expected fail-closed 403 Forbidden for nil claims in HandleFreezeAccount, got: %d", recDirect.Code)
+	}
+}
+
+func TestGatewayHandler_AmountRepresentationFormats(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: testRedisAddr})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Skipf("Redis unreachable: %v", err)
+	}
+	defer rdb.Close()
+
+	mockClient := &mockLedgerClient{}
+	idempEngine := idempotency.NewEngine(rdb)
+	log := logger.New("gateway-test", os.Stdout)
+	handler := gatewayhttp.NewGatewayHandler(mockClient, idempEngine, log)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/transactions", handler.HandleCreateTransaction)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// 1. String Amount (ISO 20022 format)
+	strPayload := []byte(`{
+		"source_account": "ACC-ALICE-01",
+		"destination_account": "ACC-BOB-02",
+		"amount": "15000.50",
+		"currency": "IDR",
+		"description": "ISO 20022 string amount test"
+	}`)
+	req1, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(strPayload))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "fmt-test-key-string-"+uuid.New().String())
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("req1 failed: %v", err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusCreated {
+		t.Errorf("expected 201 Created for string amount, got: %d", resp1.StatusCode)
+	}
+
+	// 2. Integer fixed-point units (amount_units)
+	unitsPayload := []byte(`{
+		"source_account": "ACC-ALICE-01",
+		"destination_account": "ACC-BOB-02",
+		"amount_units": 150005000,
+		"currency": "IDR",
+		"description": "Fixed-point units test"
+	}`)
+	req2, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(unitsPayload))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "fmt-test-key-units-"+uuid.New().String())
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("req2 failed: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Errorf("expected 201 Created for amount_units, got: %d", resp2.StatusCode)
+	}
+
+	// 3. String amount with > 4 decimal places -> MUST FAIL (400 Bad Request)
+	excessivePrecisionPayload := []byte(`{
+		"source_account": "ACC-ALICE-01",
+		"destination_account": "ACC-BOB-02",
+		"amount": "100.12345",
+		"currency": "IDR",
+		"description": "5 decimal places test"
+	}`)
+	req3, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(excessivePrecisionPayload))
+	req3.Header.Set("Content-Type", "application/json")
+	req3.Header.Set("Idempotency-Key", "fmt-test-key-precision-"+uuid.New().String())
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatalf("req3 failed: %v", err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for excessive decimal precision, got: %d", resp3.StatusCode)
+	}
+
+	// 4. Mismatched amount and amount_units -> MUST FAIL (400 Bad Request)
+	mismatchPayload := []byte(`{
+		"source_account": "ACC-ALICE-01",
+		"destination_account": "ACC-BOB-02",
+		"amount": "10000.00",
+		"amount_units": 200000000,
+		"currency": "IDR",
+		"description": "Mismatch test"
+	}`)
+	req4, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(mismatchPayload))
+	req4.Header.Set("Content-Type", "application/json")
+	req4.Header.Set("Idempotency-Key", "fmt-test-key-mismatch-"+uuid.New().String())
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatalf("req4 failed: %v", err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for amount/amount_units mismatch, got: %d", resp4.StatusCode)
+	}
+
+	// 5. Idempotency-Key too short (< 8 chars) -> MUST FAIL (400 Bad Request)
+	req5, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(strPayload))
+	req5.Header.Set("Content-Type", "application/json")
+	req5.Header.Set("Idempotency-Key", "short")
+	resp5, _ := http.DefaultClient.Do(req5)
+	resp5.Body.Close()
+	if resp5.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for short idempotency key, got: %d", resp5.StatusCode)
+	}
+
+	// 6. Idempotency-Key too long (> 128 chars) -> MUST FAIL (400 Bad Request)
+	req6, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(strPayload))
+	req6.Header.Set("Content-Type", "application/json")
+	req6.Header.Set("Idempotency-Key", strings.Repeat("k", 129))
+	resp6, _ := http.DefaultClient.Do(req6)
+	resp6.Body.Close()
+	if resp6.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for excessive idempotency key, got: %d", resp6.StatusCode)
+	}
+
+	// 7. Account number exceeding 32 characters -> MUST FAIL (400 Bad Request)
+	oversizedAccPayload := []byte(`{
+		"source_account": "ACC-ALICE-WAY-TOO-LONG-OVER-32-CHARS-EXCEEDED",
+		"destination_account": "ACC-BOB-02",
+		"amount": "10000.00",
+		"currency": "IDR"
+	}`)
+	req7, _ := http.NewRequest("POST", server.URL+"/api/v1/transactions", bytes.NewBuffer(oversizedAccPayload))
+	req7.Header.Set("Content-Type", "application/json")
+	req7.Header.Set("Idempotency-Key", "fmt-test-key-oversized-acc")
+	resp7, _ := http.DefaultClient.Do(req7)
+	resp7.Body.Close()
+	if resp7.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for oversized account number, got: %d", resp7.StatusCode)
 	}
 }

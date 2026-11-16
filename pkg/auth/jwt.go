@@ -39,9 +39,9 @@ type Claims struct {
 	ExpiresAt     int64  `json:"exp"`            // Unix timestamp
 }
 
-// Valid checks if the token expiration timestamp is in the future
+// Valid checks if the token expiration timestamp is in the future and strictly set
 func (c *Claims) Valid() error {
-	if c.ExpiresAt > 0 && time.Now().Unix() > c.ExpiresAt {
+	if c.ExpiresAt <= 0 || time.Now().Unix() > c.ExpiresAt {
 		return ErrExpiredToken
 	}
 	return nil
@@ -73,6 +73,10 @@ func SignToken(claims Claims, secret []byte) (string, error) {
 
 // ParseToken validates the HMAC-SHA256 signature and decodes the Claims
 func ParseToken(tokenStr string, secret []byte) (*Claims, error) {
+	if len(secret) == 0 {
+		return nil, errors.New("jwt secret cannot be empty")
+	}
+
 	parts := strings.Split(tokenStr, ".")
 	if len(parts) != 3 {
 		return nil, ErrInvalidToken

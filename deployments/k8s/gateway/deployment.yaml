@@ -45,6 +45,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: ledger-config
+            - secretRef:
+                name: ledger-secrets
           env:
             - name: HTTP_PORT
               value: "8000"

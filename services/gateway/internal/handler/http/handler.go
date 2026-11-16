@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,10 +13,12 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	ledgerv1 "github.com/wwafii/distributed-financial-ledger/api/proto/gen/ledger/v1"
 	"github.com/wwafii/distributed-financial-ledger/pkg/auth"
+	"github.com/wwafii/distributed-financial-ledger/pkg/money"
 	"github.com/wwafii/distributed-financial-ledger/pkg/telemetry"
 	"github.com/wwafii/distributed-financial-ledger/services/gateway/internal/idempotency"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -56,11 +59,12 @@ func (h *GatewayHandler) JWTSecret() []byte {
 }
 
 type CreateTransactionHTTPRequest struct {
-	SourceAccount  string  `json:"source_account"`
-	DestinationAcc string  `json:"destination_account"`
-	Amount         float64 `json:"amount"`
-	Currency       string  `json:"currency"`
-	Description    string  `json:"description"`
+	SourceAccount  string       `json:"source_account"`
+	DestinationAcc string       `json:"destination_account"`
+	Amount         money.Amount `json:"amount,omitempty"`
+	AmountUnits    int64        `json:"amount_units,omitempty"` // Optional fixed-point integer units (scaled by 10,000, e.g. 100000000 = Rp 10.000)
+	Currency       string       `json:"currency"`
+	Description    string       `json:"description"`
 }
 
 type StandardResponse struct {
@@ -82,12 +86,20 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 	ctx, span := tracer.Start(ctx, "HTTP POST /api/v1/transactions")
 	defer span.End()
 
-	idempKey := r.Header.Get("Idempotency-Key")
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idempKey == "" {
 		span.SetStatus(otelcodes.Error, "missing idempotency key")
 		writeJSON(w, http.StatusBadRequest, StandardResponse{
 			Success: false,
 			Error:   "Missing required 'Idempotency-Key' header",
+		})
+		return
+	}
+	if len(idempKey) < 8 || len(idempKey) > 128 {
+		span.SetStatus(otelcodes.Error, "invalid idempotency key length")
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Idempotency-Key length must be between 8 and 128 characters",
 		})
 		return
 	}
@@ -117,10 +129,31 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// 2.1 Support integer fixed-point units (amount_units) if amount is not specified
+	if reqBody.Amount == 0 && reqBody.AmountUnits > 0 {
+		reqBody.Amount = money.Amount(money.FromUnits(reqBody.AmountUnits))
+	} else if reqBody.Amount > 0 && reqBody.AmountUnits > 0 {
+		unitsFromAmt, _ := reqBody.Amount.Units()
+		if unitsFromAmt != reqBody.AmountUnits {
+			writeJSON(w, http.StatusBadRequest, StandardResponse{
+				Success: false,
+				Error:   "amount and amount_units mismatch",
+			})
+			return
+		}
+	}
+
 	if reqBody.SourceAccount == "" || reqBody.DestinationAcc == "" {
 		writeJSON(w, http.StatusBadRequest, StandardResponse{
 			Success: false,
 			Error:   "source_account and destination_account are required",
+		})
+		return
+	}
+	if len(reqBody.SourceAccount) < 3 || len(reqBody.SourceAccount) > 32 || len(reqBody.DestinationAcc) < 3 || len(reqBody.DestinationAcc) > 32 {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "account numbers must be between 3 and 32 characters in length",
 		})
 		return
 	}
@@ -131,7 +164,7 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		})
 		return
 	}
-	if math.IsNaN(reqBody.Amount) || math.IsInf(reqBody.Amount, 0) || reqBody.Amount <= 0 {
+	if math.IsNaN(reqBody.Amount.Float64()) || math.IsInf(reqBody.Amount.Float64(), 0) || reqBody.Amount <= 0 {
 		writeJSON(w, http.StatusBadRequest, StandardResponse{
 			Success: false,
 			Error:   "transfer amount must be a valid strictly positive number",
@@ -217,7 +250,7 @@ func (h *GatewayHandler) HandleCreateTransaction(w http.ResponseWriter, r *http.
 		ReferenceId:              idempKey,
 		SourceAccountNumber:      reqBody.SourceAccount,
 		DestinationAccountNumber: reqBody.DestinationAcc,
-		Amount:                   reqBody.Amount,
+		Amount:                   reqBody.Amount.Float64(),
 		Currency:                 reqBody.Currency,
 		Description:              reqBody.Description,
 	}
@@ -341,17 +374,15 @@ func (h *GatewayHandler) HandleFreezeAccount(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// BFLA Defense: Enforce Administrator Privileges
+	// BFLA Defense: Enforce Administrator Privileges (Fail-Closed)
 	claims := auth.FromContext(r.Context())
-	if claims != nil {
-		if claims.Role != auth.RoleAdmin && claims.Role != auth.RoleService {
-			span.SetStatus(otelcodes.Error, "unauthorized admin operation (BFLA blocked)")
-			writeJSON(w, http.StatusForbidden, StandardResponse{
-				Success: false,
-				Error:   "Forbidden: administrator privileges required to freeze accounts",
-			})
-			return
-		}
+	if claims == nil || (claims.Role != auth.RoleAdmin && claims.Role != auth.RoleService) {
+		span.SetStatus(otelcodes.Error, "unauthorized admin operation (BFLA blocked)")
+		writeJSON(w, http.StatusForbidden, StandardResponse{
+			Success: false,
+			Error:   "Forbidden: administrator privileges required to freeze accounts",
+		})
+		return
 	}
 
 	grpcResp, err := h.ledgerClient.FreezeAccount(telemetry.InjectGRPC(ctx), &ledgerv1.FreezeAccountRequest{
@@ -394,21 +425,37 @@ func (h *GatewayHandler) HandleIssueToken(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
+	if len(req.AccountNumber) < 3 || len(req.AccountNumber) > 32 {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "account_number must be between 3 and 32 characters",
+		})
+		return
+	}
 
 	if req.Role == "" {
 		req.Role = auth.RoleCustomer
 	}
 
-	// If requesting admin role, enforce admin secret
-	if req.Role == auth.RoleAdmin {
-		expectedAdminSecret := os.Getenv("ADMIN_SECRET")
-		if expectedAdminSecret == "" {
-			expectedAdminSecret = "admin-secret-dev-key"
+	// Restrict to known valid roles only (defense against role injection)
+	if req.Role != auth.RoleCustomer && req.Role != auth.RoleAdmin && req.Role != auth.RoleService {
+		writeJSON(w, http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Invalid role: allowed roles are 'customer', 'admin', 'service'",
+		})
+		return
+	}
+
+	// Enforce secret verification with constant-time compare for privileged roles (admin and service)
+	if req.Role == auth.RoleAdmin || req.Role == auth.RoleService {
+		expectedSecret := os.Getenv("ADMIN_SECRET")
+		if expectedSecret == "" {
+			expectedSecret = "admin-secret-dev-key"
 		}
-		if req.Secret != expectedAdminSecret {
+		if subtle.ConstantTimeCompare([]byte(req.Secret), []byte(expectedSecret)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, StandardResponse{
 				Success: false,
-				Error:   "Unauthorized: invalid admin secret",
+				Error:   "Unauthorized: invalid secret for privileged role",
 			})
 			return
 		}

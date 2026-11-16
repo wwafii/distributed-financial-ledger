@@ -106,7 +106,9 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, handler)
-	reflection.Register(grpcServer)
+	if os.Getenv("ENV") != "production" {
+		reflection.Register(grpcServer)
+	}
 
 	// 3. Start Prometheus Metrics HTTP Server on :9111
 	metricsPort := os.Getenv("METRICS_PORT")

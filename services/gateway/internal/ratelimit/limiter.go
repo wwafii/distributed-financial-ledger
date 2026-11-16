@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/wwafii/distributed-financial-ledger/pkg/auth"
 )
 
 type Limiter struct {
@@ -38,6 +39,9 @@ func NewLimiter(rdb *redis.Client, limit int, window time.Duration) *Limiter {
 }
 
 func getClientIP(r *http.Request) string {
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
 	xff := r.Header.Get("X-Forwarded-For")
 	if xff != "" {
 		ips := strings.Split(xff, ",")
@@ -119,7 +123,11 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		clientKey := getClientIP(r)
+		// Prefer authenticated account number as rate-limit key to prevent IP-spoofing evasion
+		clientKey := "ip:" + getClientIP(r)
+		if claims := auth.FromContext(r.Context()); claims != nil && claims.AccountNumber != "" {
+			clientKey = "acc:" + claims.AccountNumber
+		}
 
 		allowed, remaining, retryAfter, _ := l.Allow(r.Context(), clientKey)
 

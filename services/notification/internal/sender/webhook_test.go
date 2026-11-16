@@ -55,6 +55,12 @@ func TestHTTPWebhookSender_SSRFProtection(t *testing.T) {
 		t.Fatalf("expected SSRF block error on 127.0.0.1, got nil")
 	}
 
+	// 0.0.0.0 (Unspecified address) must also be blocked
+	errUnspecified := s.Send(context.Background(), "http://0.0.0.0:8080/internal/webhook", []byte(`{}`))
+	if errUnspecified == nil {
+		t.Fatalf("expected SSRF block error on 0.0.0.0, got nil")
+	}
+
 	if sender.IsRetryable(err) {
 		t.Errorf("expected SSRF violation to be NonRetryable, got retryable: %v", err)
 	}

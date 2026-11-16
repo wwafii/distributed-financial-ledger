@@ -117,9 +117,9 @@ func NewHTTPWebhookSender(timeout time.Duration, opts ...WebhookSenderOption) *H
 	return sender
 }
 
-// isPrivateIP checks if an IP belongs to RFC1918, loopback, or cloud link-local metadata (169.254.169.254)
+// isPrivateIP checks if an IP belongs to RFC1918, loopback, unspecified (0.0.0.0), or cloud link-local metadata (169.254.169.254)
 func isPrivateIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() || ip.IsUnspecified() {
 		return true
 	}
 	// Cloud metadata 169.254.169.254 check
